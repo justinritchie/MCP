@@ -405,6 +405,13 @@ No build step — pure ESM JavaScript, runs directly with `node src/index.js`. R
 
 13. **`gv_*` tools load asynchronously and self-heal.** The abilities catalog is fetched in the background after startup, so `gv_*` tools may be absent for a moment (the server emits a `tools/listChanged` once they arrive). If a catalog fetch fails, it retries after a cooldown or immediately on `gk_reload_abilities`. The `src/gravityview/` Inspector client is a test/demo harness only — runtime `gv_*` come from the abilities loader.
 
+## Bench (`bench/`) — target + running gotchas
+
+- **Don't let the bench hit a REMOTE site.** `config.mjs` `resolveTarget()` reads `GRAVITY_FORMS_TEST_BASE_URL` BEFORE `GRAVITY_FORMS_BASE_URL`, and the machine's shell env (`~/.monokit/.env`) sets `GRAVITY_FORMS_TEST_*` to a remote `*.try.gravitykit.com` site. So setting only `GRAVITY_FORMS_BASE_URL` silently runs the bench against that REMOTE site — and write tasks (create/patch) would create data there. Either use `--mint` (self-contained siteminter target; ignores the env) or pin ALL of `GRAVITY_FORMS_TEST_BASE_URL`/`_CONSUMER_KEY`/`_CONSUMER_SECRET` + `GRAVITYKIT_WP_URL`/`_USERNAME`/`_APP_PASSWORD` to your local site. [2026-07]
+- **A minted site needs GF REST v2 enabled for `gf_*` + the grader's GF calls** (`gravityformsaddon_gravityformswebapi_settings.enabled=1`). `--mint`'s `provisionSite` sets it; a hand-minted siteminter site does NOT (forms endpoint 404s until you flip it). [2026-07]
+- **Bench any product, not just GravityView:** `BENCH_PLUGINS=<GF>,<Foundation>,<product>` (absolute paths) overrides the minted plugin list. GravityCharts abilities: `BENCH_PLUGINS=…/gravityforms,…/Foundation,…/gravitycharts BENCH_SITE=gcbench node bench/run.mjs --mint --keep --task charts`. PHP is symlinked, so ability refinements go live on the kept site with no re-mint. [2026-07]
+- **The grader's `client.ability(name,input)` returns `{status, data}`** — read the ability payload at `.data` (e.g. `res.data.charts`), and its data-point objects can be `{value,label,x}`, not bare numbers. [2026-07]
+
 ## Packaging
 
 What ships to npm is governed solely by the **`files` allowlist** in `package.json` — there is intentionally **no `.npmignore`** (with a `files` field present npm ignores it, so keeping one is misleading). Allowlist, not denylist: a new file ships only if it matches `files`.
