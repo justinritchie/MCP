@@ -22,6 +22,8 @@ import FieldAwareValidator from './config/field-validation.js';
 import logger from './utils/logger.js';
 import { sanitize } from './utils/sanitize.js';
 import { stripEmpty, stripEntryMetaFromResponse } from './utils/compact.js';
+import fs from 'fs';
+import os from 'os';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -46,10 +48,94 @@ const server = new Server(
   }
 );
 
-// Global client instance
+// Global client instance (per-call this is pointed at the resolved site)
 let gravityFormsClient = null;
 let fieldOperations = null;
 let fieldValidator = null;
+
+// ---------------------------------------------------------------------------
+// Multi-site support
+// ---------------------------------------------------------------------------
+// Credentials for every GravityKit site live in a sites config file:
+//   ~/.mcp-credentials/gravitykit-sites.json
+//   { "cbrcsummit": { "base": "https://cbrcsummit.net",
+//                     "key": "ck_…", "secret": "cs_…" }, ... }
+// The file is re-read on every call (mtime-cached), so you can HOT-SWAP a new
+// site in mid-session — add it to the JSON and use it immediately, no restart.
+// Each tool takes an optional `site` param; default is GRAVITY_DEFAULT_SITE or
+// 'cbrcsummit'. Falls back to single-site env vars if no config file exists.
+const SITES_FILE = process.env.GRAVITY_SITES_FILE
+  || join(os.homedir(), '.mcp-credentials/gravitykit-sites.json');
+const DEFAULT_SITE = process.env.GRAVITY_DEFAULT_SITE || 'cbrcsummit';
+
+let _sitesCache = null;
+let _sitesMtime = -1;
+let _clients = {}; // site label -> { client, fieldOps }
+
+function loadSites() {
+  try {
+    const st = fs.statSync(SITES_FILE);
+    if (_sitesCache === null || st.mtimeMs !== _sitesMtime) {
+      _sitesCache = JSON.parse(fs.readFileSync(SITES_FILE, 'utf8'));
+      _sitesMtime = st.mtimeMs;
+      _clients = {}; // config changed -> drop cached clients so edits take effect
+    }
+  } catch (e) {
+    // No sites file: fall back to single-site env vars (back-compat).
+    if (process.env.GRAVITY_FORMS_BASE_URL) {
+      _sitesCache = { [DEFAULT_SITE]: {
+        base: process.env.GRAVITY_FORMS_BASE_URL,
+        key: process.env.GRAVITY_FORMS_CONSUMER_KEY,
+        secret: process.env.GRAVITY_FORMS_CONSUMER_SECRET
+      } };
+    } else if (_sitesCache === null) {
+      _sitesCache = {};
+    }
+  }
+  return _sitesCache;
+}
+
+async function resolveSite(siteLabel) {
+  const sites = loadSites();
+  const label = siteLabel || DEFAULT_SITE;
+  const cfg = sites[label];
+  if (!cfg || !cfg.base || !cfg.key || !cfg.secret) {
+    const valid = Object.keys(sites).join(', ') || '(none configured)';
+    throw new Error(
+      `Unknown or incomplete GravityKit site '${label}'. Configured: ${valid}. `
+      + `Add base/key/secret for it to ${SITES_FILE}.`
+    );
+  }
+  if (!_clients[label]) {
+    if (!fieldValidator) fieldValidator = new FieldAwareValidator();
+    const client = new GravityFormsClient({
+      ...process.env,
+      GRAVITY_FORMS_BASE_URL: cfg.base,
+      GRAVITY_FORMS_CONSUMER_KEY: cfg.key,
+      GRAVITY_FORMS_CONSUMER_SECRET: cfg.secret
+    });
+    const validation = await client.initialize();
+    if (!validation.available) {
+      throw new Error(`GravityKit site '${label}' (${cfg.base}) failed to initialize: ${validation.error}`);
+    }
+    const fieldOps = createFieldOperations(client, fieldRegistry, fieldValidator);
+    _clients[label] = { client, fieldOps };
+  }
+  return _clients[label];
+}
+
+// Inject an optional `site` param into a tool's input schema so the model can
+// target any configured site (default = DEFAULT_SITE).
+function _withSite(tool) {
+  const props = { ...((tool.inputSchema && tool.inputSchema.properties) || {}) };
+  if (!props.site) {
+    props.site = {
+      type: 'string',
+      description: `Target GravityKit site (default '${DEFAULT_SITE}'). Sites are configured in the gravitykit-sites.json credentials file — add one there and it's usable immediately (hot-swap, no restart).`
+    };
+  }
+  return { ...tool, inputSchema: { type: 'object', ...(tool.inputSchema || {}), properties: props } };
+}
 
 /**
  * Initialize Gravity Forms client
@@ -135,8 +221,7 @@ function wrapHandler(handler, params = {}) {
 // =================================
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return {
-    tools: [
+  const _allTools = [
       // Forms Management (6 tools)
       {
         name: 'gf_list_forms',
@@ -541,8 +626,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 
       // Field Operations (4 tools) - Intelligent field management
       ...fieldOperationTools
-    ]
-  };
+  ];
+  return { tools: _allTools.map(_withSite) };
 });
 
 // =================================
@@ -553,9 +638,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: params } = request.params;
 
-  // Ensure client is initialized
-  if (!gravityFormsClient) {
-    await initializeClient();
+  // Multi-site: resolve the target site (hot-reloads the config file each call)
+  // and point the active client/fieldOps at it before dispatching. Strip the
+  // `site` arg so it never leaks into a Gravity Forms request.
+  try {
+    const resolved = await resolveSite(params && params.site);
+    gravityFormsClient = resolved.client;
+    fieldOperations = resolved.fieldOps;
+  } catch (e) {
+    return createErrorResponse(e.message);
+  }
+  if (params && 'site' in params) {
+    delete params.site;
   }
 
   // Route to appropriate handler
@@ -670,8 +764,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 async function main() {
   try {
-    // Initialize client on startup
-    await initializeClient();
+    // Multi-site: don't bind a single client at boot — clients are created
+    // lazily per call by resolveSite() from the sites config file. Just prep
+    // the shared field validator.
+    fieldValidator = new FieldAwareValidator();
 
     // Create stdio transport
     const transport = new StdioServerTransport();
