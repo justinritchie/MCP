@@ -303,7 +303,17 @@ export async function runConversation(prompts, mcpConfigPath, logFile = null, ma
   for (let i = 0; i < prompts.length; i++) {
     const turnLog = logFile ? logFile.replace(/\.jsonl$/, `.turn${i + 1}.jsonl`) : null;
     const extraArgs = sessionId ? ['--resume', sessionId] : [];
-    const t = await runOnce(prompts[i], mcpConfigPath, turnLog, maxTurns, CLAUDE_BIN, extraArgs);
+    let t = await runOnce(prompts[i], mcpConfigPath, turnLog, maxTurns, CLAUDE_BIN, extraArgs);
+
+    // Align with runAgent(): retry ONCE on a genuine process-level crash
+    // (no result at all) — but only before any --resume state exists, so a
+    // retried turn can never replay against a session the crash half-built.
+    const processCrashed = !t.finalText && /^exit_/.test(t.hardError || '');
+    if (processCrashed && !sessionId) {
+      await new Promise((r) => setTimeout(r, 1500));
+      t = await runOnce(prompts[i], mcpConfigPath, turnLog, maxTurns, CLAUDE_BIN, extraArgs);
+      merged.attempts += 1;
+    }
 
     merged.toolCalls.push(...(t.toolCalls || []));
     merged.turns += t.turns || 0;
