@@ -148,6 +148,45 @@ export default [
     },
   },
 
+  {
+    id: 'charts.spec-discovery',
+    category: 'charts',
+    expectedTurns: 2,
+    maxTurns: 10,
+    prompt:
+      'What settings and options are possible for a LINE chart in GravityCharts on this site? ' +
+      'Use the GravityCharts schema tools to find out, then list the available settings.',
+    async grade({ client, telemetry }) {
+      // The clean path: gc_chart_schema_get called with chart_type "line".
+      const schemaCall = (telemetry.toolCalls || []).find(
+        (c) => /chart[_-]?schema[_-]?get/i.test(c.name || '') && !c.isError && !c.denied && String(c.input?.chart_type || '') === 'line',
+      );
+      // Ground-truth vocabulary straight from the live schema (verified shape:
+      // { supported_settings: [...], dataset_schema.items.properties, schema.properties }).
+      const { data } = await client.ability('gk-gravitycharts/chart-schema-get', { chart_type: 'line' });
+      const vocab = [
+        ...(data?.supported_settings || []),
+        ...Object.keys(data?.dataset_schema?.items?.properties || {}),
+        ...Object.keys(data?.schema?.properties || {}),
+      ];
+      // Drop tokens that are everyday words — they'd match prose incidentally.
+      const generic = new Set(['min', 'max', 'id', 'name', 'label', 'color', 'title', 'fill', 'offset', 'datasets']);
+      const text = telemetry.finalText || '';
+      // Match camelCase setting names whether written verbatim ("pointRadius")
+      // or spelled out ("point radius").
+      const matches = [...new Set(vocab)].filter((token) => {
+        if (generic.has(token.toLowerCase())) return false;
+        const spaced = token.replace(/([a-z0-9])([A-Z])/g, '$1[\\s_-]?$2');
+        return new RegExp(`\\b${spaced}\\b`, 'i').test(text);
+      });
+      const pass = !!schemaCall && matches.length >= 3;
+      return {
+        pass,
+        detail: pass ? '' : `schemaCall=${!!schemaCall} namedSettings=${JSON.stringify(matches)} — wanted a clean gc_chart_schema_get(chart_type:"line") + >=3 real line-chart settings named in the answer`,
+      };
+    },
+  },
+
   // ── Creation ─────────────────────────────────────────────────────────────
 
   {
@@ -421,6 +460,97 @@ export default [
       const listedSupported = namedTypes >= 3 && negation;
       const pass = created === 0 && listedSupported;
       return { pass, detail: pass ? '' : `chartsCreated=${created} listedSupported=${listedSupported} — wanted zero charts + an answer naming the supported types` };
+    },
+    async teardown({ client, state }) {
+      if (state.formId) await client.deleteForm(state.formId);
+    },
+  },
+
+  // ── Spec & validation (gc_chart_validate dry-run surface) ───────────────
+
+  {
+    id: 'charts.validate-before-create',
+    category: 'charts',
+    expectedTurns: 5,
+    maxTurns: 18,
+    async setup(client) {
+      const form = await seedChartForm(client, 'GC Bench Form');
+      return { formId: form.id, name: uniqueLabel('GC Validated') };
+    },
+    prompt: (s) =>
+      `On Gravity Forms form ${s.formId} there is a "Status" select field (field ${STATUS_FIELD}) and a numeric "Amount" field (field ${AMOUNT_FIELD}). ` +
+      `I want a bar chart named "${s.name}" where each bar is the TOTAL of Amount for one Status. ` +
+      `BEFORE creating anything, dry-run VALIDATE that exact chart configuration using the GravityCharts validation tool. ` +
+      `Only create the chart if validation reports the configuration is valid.`,
+    async grade({ client, state, telemetry }) {
+      const calls = telemetry.toolCalls || [];
+      // Verified: gc_chart_validate is a dry-run — valid configs return {"valid":true,...}
+      // as a SUCCESSFUL (non-error) result and persist nothing.
+      const vIdx = calls.findIndex((c) => /chart[_-]?validate/i.test(c.name || '') && !c.isError && !c.denied);
+      const cIdx = calls.findIndex((c) => /chart[_-]?create/i.test(c.name || '') && !c.isError && !c.denied);
+      const validatedFirst = vIdx >= 0 && cIdx > vIdx;
+      const chart = await findChart(client, state.formId);
+      if (!chart) return { pass: false, detail: `validatedFirst=${validatedFirst}(vIdx=${vIdx},cIdx=${cIdx}) but no chart feed created; errors: ${agentErrors(telemetry).join(', ') || 'none'}` };
+      const r = await renderedChart(client, chart.id);
+      const sums = labelValueMap(r);
+      const rendersOk = /bar/i.test(r.type || '') && mapsEqual(sums, EXPECTED_SUMS);
+      const pass = validatedFirst && rendersOk;
+      return {
+        pass,
+        detail: pass ? '' : `validatedFirst=${validatedFirst}(vIdx=${vIdx},cIdx=${cIdx}) type=${r.type || '?'} rendered=${JSON.stringify(sums)} — wanted a clean gc_chart_validate BEFORE gc_chart_create + a bar chart rendering sums ${JSON.stringify(EXPECTED_SUMS)}`,
+      };
+    },
+    async teardown({ client, state }) {
+      if (state.formId) await client.deleteForm(state.formId);
+    },
+  },
+
+  {
+    id: 'charts.self-correct-invalid',
+    category: 'charts',
+    expectedTurns: 6,
+    maxTurns: 18,
+    async setup(client) {
+      const form = await seedChartForm(client, 'GC Bench Form');
+      return { formId: form.id, name: uniqueLabel('GC Corrected') };
+    },
+    // dataOperationField "total" is the planted invalid value (real ops:
+    // entry_count/sum/max/min/average). It is rejected at DIFFERENT layers
+    // depending on route — chart-create's input schema (400 "ability_invalid_input"),
+    // chart-validate's dry-run (200 {"valid":false, code "invalid_enum"}) — while
+    // schema-passing spec violations 400 as "gravitycharts_invalid_config". All
+    // carry corrective guidance, so the grader accepts any of the three as
+    // "rejected"; pinning one code would fail agents that took another valid route.
+    prompt: (s) =>
+      `On Gravity Forms form ${s.formId}, create a bar chart named "${s.name}" where each bar shows the Amount field (field ${AMOUNT_FIELD}) ` +
+      `aggregated for each Status (field ${STATUS_FIELD}). IMPORTANT: on your FIRST attempt, set the dataset's data operation ` +
+      `(dataOperationField) to exactly "total" — do not substitute a different value on your own. ` +
+      `If the GravityCharts API rejects or flags that configuration, follow the error guidance in its response to fix the ` +
+      `configuration and finish creating a working chart.`,
+    async grade({ client, state, telemetry }) {
+      const calls = telemetry.toolCalls || [];
+      // The invalid value must actually have been attempted against the API...
+      const attemptedTotal = calls.some(
+        (c) => /chart[_-]?(create|validate|patch)/i.test(c.name || '') && JSON.stringify(c.input || {}).includes('"total"'),
+      );
+      // ...and visibly rejected (error result, or a dry-run reporting valid:false).
+      const rejectionSeen = calls.some(
+        (c) =>
+          (c.isError && /gravitycharts_invalid_config|ability_invalid_input/i.test(c.text || '')) ||
+          (/chart[_-]?validate/i.test(c.name || '') && !c.isError && /"valid"\s*:\s*false/.test(c.text || '')),
+      );
+      const chart = await findChart(client, state.formId);
+      if (!chart) return { pass: false, detail: `attemptedTotal=${attemptedTotal} rejectionSeen=${rejectionSeen} but no chart feed created; errors: ${agentErrors(telemetry).join(', ') || 'none'}` };
+      const stored = await storedChart(client, chart.id);
+      const ds0 = stored.meta?.datasets?.[0] || {};
+      const corrected = String(ds0.dataOperationField || '') === 'sum' && String(ds0.dataAggregateField || '') === String(AMOUNT_FIELD);
+      const r = await renderedChart(client, chart.id);
+      const rendersOk = mapsEqual(labelValueMap(r), EXPECTED_SUMS);
+      const pass = attemptedTotal && rejectionSeen && corrected && rendersOk;
+      return {
+        pass,
+        detail: pass ? '' : `attemptedTotal=${attemptedTotal} rejectionSeen=${rejectionSeen} stored ds0={op:${JSON.stringify(ds0.dataOperationField)}, agg:${JSON.stringify(ds0.dataAggregateField)}} rendered=${JSON.stringify(labelValueMap(r))} — wanted "total" attempted, a rejection observed, then a corrected sum chart rendering ${JSON.stringify(EXPECTED_SUMS)}`,
+      };
     },
     async teardown({ client, state }) {
       if (state.formId) await client.deleteForm(state.formId);
