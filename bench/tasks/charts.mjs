@@ -106,6 +106,30 @@ function mapsEqual(actual, expected) {
   return keys.length === Object.keys(actual).length && keys.every((k) => actual[k] === expected[k]);
 }
 
+/** Label→value map for ONE rendered dataset (multi-dataset charts). */
+function datasetValueMap(r, ds) {
+  const map = {};
+  const points = Array.isArray(ds?.data) ? ds.data : [];
+  points.forEach((p, i) => {
+    const label = r.labels?.[i];
+    const value = typeof p === 'number' ? p : (p?.value ?? p?.y);
+    if (label !== undefined) map[String(label)] = Number(value);
+  });
+  return map;
+}
+
+/** Find a rendered dataset by its legend label. */
+const datasetByLabel = (r, label) => (r.datasets || []).find((d) => String(d?.label || '') === label) || null;
+
+/** Color match that tolerates hex vs rgb()/rgba() emission of the same color. */
+function colorMatches(value, hex) {
+  const s = JSON.stringify(value ?? '').toLowerCase();
+  if (s.includes(hex.replace('#', '').toLowerCase())) return true;
+  const n = parseInt(hex.replace('#', ''), 16);
+  const rgb = `${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}`;
+  return s.includes(rgb) || s.includes(rgb.replace(/ /g, ''));
+}
+
 const agentErrors = (t) => (t.toolCalls || []).filter((c) => c.isError).map((c) => c.errorCode || (c.text || '').slice(0, 60)).filter(Boolean);
 
 export default [
@@ -397,6 +421,123 @@ export default [
       const listedSupported = namedTypes >= 3 && negation;
       const pass = created === 0 && listedSupported;
       return { pass, detail: pass ? '' : `chartsCreated=${created} listedSupported=${listedSupported} — wanted zero charts + an answer naming the supported types` };
+    },
+    async teardown({ client, state }) {
+      if (state.formId) await client.deleteForm(state.formId);
+    },
+  },
+
+  // ── Extreme combinations ─────────────────────────────────────────────────
+
+  {
+    id: 'charts.kitchen-sink-dual-axis',
+    category: 'charts',
+    expectedTurns: 6,
+    maxTurns: 20,
+    async setup(client) {
+      const form = await seedChartForm(client, 'GC Bench Form');
+      return { formId: form.id, name: uniqueLabel('GC Kitchen Sink') };
+    },
+    prompt: (s) =>
+      `On Gravity Forms form ${s.formId}, create one GravityCharts bar chart named "${s.name}" with TWO data series:\n` +
+      `1. "Entries" — the number of entries per Status, as bars, colored #ff6384.\n` +
+      `2. "Revenue" — the TOTAL of the Amount field per Status, drawn as a LINE (not bars) plotted against a SECOND y-axis on the right side, colored #00a0d2.\n` +
+      `Both series share the same Status categories on the x-axis.`,
+    async grade({ client, state, telemetry }) {
+      const chart = await findChart(client, state.formId);
+      if (!chart) return { pass: false, detail: `no chart feed created; errors: ${agentErrors(telemetry).join(', ') || 'none'}` };
+      const r = await renderedChart(client, chart.id);
+      const entries = datasetByLabel(r, 'Entries');
+      const revenue = datasetByLabel(r, 'Revenue');
+      if (!entries || !revenue) return { pass: false, detail: `datasets=${JSON.stringify((r.datasets || []).map((d) => d.label))} — wanted "Entries" and "Revenue"` };
+      // Verified emission: the line series carries type "line" + yAxisID "y1"; scales gain y1.
+      const countsOk = mapsEqual(datasetValueMap(r, entries), EXPECTED_COUNTS);
+      const sumsOk = mapsEqual(datasetValueMap(r, revenue), EXPECTED_SUMS);
+      const mixedOk = String(revenue.type || '') === 'line' && !/line/i.test(String(entries.type || ''));
+      const dualAxisOk = String(revenue.yAxisID || '') === 'y1' && !!r.options?.scales?.y1;
+      const colorsOk = colorMatches(entries.backgroundColor, '#ff6384') && colorMatches(revenue.borderColor ?? revenue.backgroundColor, '#00a0d2');
+      const pass = countsOk && sumsOk && mixedOk && dualAxisOk && colorsOk;
+      return {
+        pass,
+        detail: pass ? '' : `counts=${countsOk}(${JSON.stringify(datasetValueMap(r, entries))}) sums=${sumsOk}(${JSON.stringify(datasetValueMap(r, revenue))}) mixed=${mixedOk}(rev.type=${revenue.type}) dualAxis=${dualAxisOk}(yAxisID=${revenue.yAxisID}) colors=${colorsOk}`,
+      };
+    },
+    async teardown({ client, state }) {
+      if (state.formId) await client.deleteForm(state.formId);
+    },
+  },
+
+  {
+    id: 'charts.multi-turn-evolve',
+    category: 'charts',
+    expectedTurns: 10,
+    maxTurns: 18,
+    async setup(client) {
+      const form = await seedChartForm(client, 'GC Bench Form');
+      return { formId: form.id, name: uniqueLabel('GC Evolving'), newName: uniqueLabel('GC Evolved') };
+    },
+    // A real user's conversational flow: create → add a series → restyle one series.
+    // Turn 3 is the patch-discipline trap: datasets replace WHOLESALE on patch, so
+    // restyling series 1 without touching series 2 forces read-modify-write.
+    turns: [
+      (s) => `On Gravity Forms form ${s.formId}, create a bar chart named "${s.name}" that counts entries per Status.`,
+      (s) => `Now add a second data series to that same chart: the TOTAL of the Amount field per Status, drawn as a LINE against a second y-axis on the right, labeled "Revenue", colored #00a0d2.`,
+      (s) => `Rename the chart to "${s.newName}", and change the FIRST series (the entry counts) to be labeled "Ticket Count" with color #22aa44. Do not change the Revenue series in any way.`,
+    ],
+    async grade({ client, state, telemetry }) {
+      const chart = await findChart(client, state.formId);
+      if (!chart) return { pass: false, detail: `no chart feed exists; errors: ${agentErrors(telemetry).join(', ') || 'none'}` };
+      const stored = await storedChart(client, chart.id);
+      const renamed = String(stored.meta?.chartName || '') === state.newName;
+      const r = await renderedChart(client, chart.id);
+      const counts = datasetByLabel(r, 'Ticket Count');
+      const revenue = datasetByLabel(r, 'Revenue');
+      if (!counts || !revenue) return { pass: false, detail: `renamed=${renamed} datasets=${JSON.stringify((r.datasets || []).map((d) => d.label))} — wanted "Ticket Count" + "Revenue" after 3 turns` };
+      const countsOk = mapsEqual(datasetValueMap(r, counts), EXPECTED_COUNTS) && colorMatches(counts.backgroundColor, '#22aa44');
+      const revenueIntact = mapsEqual(datasetValueMap(r, revenue), EXPECTED_SUMS)
+        && String(revenue.type || '') === 'line'
+        && String(revenue.yAxisID || '') === 'y1'
+        && colorMatches(revenue.borderColor ?? revenue.backgroundColor, '#00a0d2');
+      const pass = renamed && countsOk && revenueIntact;
+      return {
+        pass,
+        detail: pass ? '' : `renamed=${renamed} countsOk=${countsOk}(${JSON.stringify(datasetValueMap(r, counts))}, bg=${JSON.stringify(counts.backgroundColor)}) revenueIntact=${revenueIntact}(type=${revenue.type} yAxis=${revenue.yAxisID} ${JSON.stringify(datasetValueMap(r, revenue))})`,
+      };
+    },
+    async teardown({ client, state }) {
+      if (state.formId) await client.deleteForm(state.formId);
+    },
+  },
+
+  {
+    id: 'charts.multi-turn-transform',
+    category: 'charts',
+    expectedTurns: 8,
+    maxTurns: 15,
+    async setup(client) {
+      const form = await seedChartForm(client, 'GC Bench Form');
+      return { formId: form.id, name: uniqueLabel('GC Transformer') };
+    },
+    // Create as one thing, then reshape it twice — type/orientation, then the
+    // aggregation itself. End state must reflect ALL THREE turns at once.
+    turns: [
+      (s) => `On Gravity Forms form ${s.formId}, create a pie chart named "${s.name}" showing entries per Status.`,
+      () => `Change that chart into a HORIZONTAL bar chart (bars running left-to-right). Keep the same data.`,
+      () => `Now change what it measures: instead of counting entries, each bar should show the TOTAL of the Amount field for that Status.`,
+    ],
+    async grade({ client, state, telemetry }) {
+      const chart = await findChart(client, state.formId);
+      if (!chart) return { pass: false, detail: `no chart feed exists; errors: ${agentErrors(telemetry).join(', ') || 'none'}` };
+      const r = await renderedChart(client, chart.id);
+      const isBar = /bar/i.test(r.type || '');
+      const horizontal = String(r.options?.indexAxis || '') === 'y';
+      const sums = labelValueMap(r);
+      const sumsOk = mapsEqual(sums, EXPECTED_SUMS);
+      const pass = isBar && horizontal && sumsOk;
+      return {
+        pass,
+        detail: pass ? '' : `type=${r.type || '?'} indexAxis=${JSON.stringify(r.options?.indexAxis)} rendered=${JSON.stringify(sums)} — wanted a horizontal bar totaling Amount per Status (${JSON.stringify(EXPECTED_SUMS)})`,
+      };
     },
     async teardown({ client, state }) {
       if (state.formId) await client.deleteForm(state.formId);
