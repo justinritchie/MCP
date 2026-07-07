@@ -43,8 +43,8 @@ export class FieldAwareValidator {
       } else {
         errors.push({
           index: i,
-          fieldId: field.id,
-          fieldType: field.type,
+          fieldId: field?.id,
+          fieldType: field?.type,
           error: validation.error
         });
       }
@@ -89,10 +89,12 @@ export class FieldAwareValidator {
         logger.warn(`[FieldValidator] Unknown field type '${field.type}' at ${path}`);
       }
 
-      // Allow unknown types but mark them
+      // Allow unknown types (third-party add-ons, GravityKit, custom fields).
+      // Gravity Forms accepts them on save; pass the field through unchanged. No
+      // internal flag is added: it would be PUT verbatim and nothing reads it.
       return {
         isValid: true,
-        field: { ...field, _unknown: true }
+        field: { ...field }
       };
     }
 
@@ -617,6 +619,37 @@ export class FieldAwareValidator {
     }
 
     return summary;
+  }
+
+  /**
+   * Non-fatal warnings for a single field, surfaced by gf_add_field and
+   * gf_update_field. Never throws — returns an array of human-readable strings
+   * (empty when the field looks fine).
+   *
+   * @param {object} field A Gravity Forms field object.
+   * @returns {string[]}
+   */
+  getWarnings(field) {
+    const warnings = [];
+    if (!field || typeof field !== 'object') {
+      return warnings;
+    }
+
+    const id = field.id != null ? String(field.id) : '?';
+
+    const label = typeof field.label === 'string' ? field.label.trim() : '';
+    if (!label) {
+      warnings.push(`Field ${id} has no label.`);
+    }
+
+    // Choice-based fields should define choices.
+    const choiceTypes = ['select', 'multiselect', 'checkbox', 'radio'];
+    const hasChoices = Array.isArray(field.choices) && field.choices.length > 0;
+    if (choiceTypes.includes(field.type) && !hasChoices) {
+      warnings.push(`Field ${id} (${field.type}) has no choices defined.`);
+    }
+
+    return warnings;
   }
 }
 

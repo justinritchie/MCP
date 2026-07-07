@@ -1,0 +1,483 @@
+/**
+ * Submissions and Notifications Tests for Gravity MCP
+ * Tests form submission workflow, validation, and notifications
+ */
+
+import GravityFormsClient from '../src/gravity-forms-client.js';
+import {
+  TestRunner,
+  TestAssert,
+  MockHttpClient,
+  MockResponse,
+  setupTestEnvironment
+} from './helpers.js';
+
+const suite = new TestRunner('Submissions and Notifications Tests');
+
+let client;
+let mockHttpClient;
+let testEnv;
+
+suite.beforeEach(() => {
+  testEnv = setupTestEnvironment();
+  mockHttpClient = new MockHttpClient();
+
+  client = new GravityFormsClient(testEnv);
+  client.httpClient = mockHttpClient;
+
+  mockHttpClient.setMockResponse('GET', '/forms', new MockResponse({ forms: [] }));
+});
+
+// =================================
+// SUBMIT FORM DATA TESTS
+// =================================
+
+suite.test('Submit Form: Should submit form successfully', async () => {
+  mockHttpClient.setMockResponse('POST', '/forms/1/submissions', new MockResponse({
+    is_valid: true,
+    entry_id: 500,
+    confirmation_message: '<p>Thank you for your submission!</p>',
+    validation_messages: {}
+  }));
+
+  const result = await client.submitFormData({
+    form_id: 1,
+    input_1: 'John Doe',
+    input_2: 'john@example.com',
+    input_3: 'This is my message'
+  });
+
+  TestAssert.isTrue(result.success);
+  TestAssert.equal(result.entry_id, 500);
+  TestAssert.includes(result.confirmation_message, 'Thank you');
+});
+
+suite.test('Submit Form: Should handle validation errors', async () => {
+  mockHttpClient.setMockResponse('POST', '/forms/1/submissions', new MockResponse({
+    is_valid: false,
+    validation_messages: {
+      '1': 'Name is required',
+      '2': 'Please enter a valid email address'
+    }
+  }));
+
+  const result = await client.submitFormData({
+    form_id: 1,
+    input_3: 'Only message provided'
+  });
+
+  TestAssert.isFalse(result.success);
+  TestAssert.equal(result.validation_messages['1'], 'Name is required');
+});
+
+suite.test('Submit Form: Should include field values', async () => {
+  mockHttpClient.setMockResponse('POST', '/forms/1/submissions', new MockResponse({
+    is_valid: true,
+    entry_id: 600
+  }));
+
+  const result = await client.submitFormData({
+    form_id: 1,
+    input_1: 'Jane Smith',
+    input_2: 'jane@example.com',
+    // Submission values are the input_N keys above. field_values is GF
+    // dynamic-population data — a query string (or array), not an object.
+    field_values: 'utm_source=google&utm_campaign=summer2024'
+  });
+
+  TestAssert.isTrue(result.success);
+  TestAssert.equal(result.entry_id, 600);
+
+  // Valid shape reaches the wire: input_N values + the field_values string.
+  const body = mockHttpClient.getRequests().find(r => r.method === 'POST').config.data;
+  TestAssert.equal(body.input_1, 'Jane Smith');
+  TestAssert.equal(body.field_values, 'utm_source=google&utm_campaign=summer2024');
+});
+
+suite.test('Submit Form: rejects a field_values OBJECT (GF wants a string/array)', async () => {
+  // Invalid shape — GF declares field_values as ['string','array'] and 400s an
+  // object. The client must reject it up front rather than send a 400-bound body.
+  await TestAssert.throwsAsync(
+    () => client.submitFormData({ form_id: 1, field_values: { '1': 'x' } }),
+    'field_values',
+    'object field_values must be rejected'
+  );
+});
+
+suite.test('Submit Form: Should handle multi-page form submission', async () => {
+  mockHttpClient.setMockResponse('POST', '/forms/1/submissions', new MockResponse({
+    is_valid: true,
+    page_number: 2,
+    source_page_number: 1,
+    is_last_page: false,
+    confirmation_message: ''
+  }));
+
+  const result = await client.submitFormData({
+    form_id: 1,
+    input_1: 'Page 1 data',
+    source_page_number: 1,
+    target_page_number: 2
+  });
+
+  // Multi-page progression doesn't complete submission
+  TestAssert.isTrue(result.success);
+  TestAssert.isNull(result.entry_id || null);
+});
+
+suite.test('Submit Form: Should handle file upload fields', async () => {
+  mockHttpClient.setMockResponse('POST', '/forms/1/submissions', new MockResponse({
+    is_valid: true,
+    entry_id: 700,
+    uploaded_files: {
+      'input_5': 'https://example.com/uploads/file.pdf'
+    }
+  }));
+
+  const result = await client.submitFormData({
+    form_id: 1,
+    input_1: 'John',
+    input_5: 'file.pdf' // File upload field
+  });
+
+  TestAssert.isTrue(result.success);
+  TestAssert.equal(result.entry_id, 700);
+});
+
+suite.test('Submit Form: Should handle conditional logic', async () => {
+  mockHttpClient.setMockResponse('POST', '/forms/1/submissions', new MockResponse({
+    is_valid: true,
+    entry_id: 800,
+    evaluated_conditional_logic: {
+      '3': { is_visible: false },
+      '4': { is_visible: true }
+    }
+  }));
+
+  const result = await client.submitFormData({
+    form_id: 1,
+    input_1: 'trigger_value',
+    input_4: 'Conditional field shown'
+  });
+
+  TestAssert.isTrue(result.success);
+  TestAssert.equal(result.entry_id, 800);
+});
+
+suite.test('Submit Form: Should require form_id', async () => {
+  await TestAssert.throwsAsync(
+    () => client.submitFormData({ input_1: 'Test' }),
+    'form_id is required',
+    'Should require form_id'
+  );
+});
+
+// =================================
+// VALIDATE SUBMISSION TESTS
+// =================================
+
+suite.test('Validate Submission: posts to the dedicated /validation route (never the submit route)', async () => {
+  mockHttpClient.setMockResponse('POST', '/forms/1/submissions/validation', new MockResponse({
+    is_valid: true,
+    validation_messages: {},
+    page_number: 0
+  }));
+
+  const result = await client.validateSubmission({
+    form_id: 1,
+    input_1: 'John Doe',
+    input_2: 'john@example.com'
+  });
+
+  // The crux of the P0: GF ignores a body validation_only flag and a POST to
+  // /submissions REALLY submits. Validation must hit /submissions/validation.
+  const req = mockHttpClient.getRequests().find(r => r.method === 'POST');
+  TestAssert.equal(req.path, '/forms/1/submissions/validation');
+  TestAssert.isFalse('validation_only' in (req.config.data || {}), 'must not send a validation_only flag');
+  TestAssert.isTrue(result.valid);
+});
+
+suite.test('Validate Submission: surfaces validation_messages + page_number, not a phantom field_errors', async () => {
+  mockHttpClient.setMockResponse('POST', '/forms/1/submissions/validation', new MockResponse({
+    is_valid: false,
+    validation_messages: {
+      '2': 'Email is invalid',
+      '3': 'Message must be at least 10 characters'
+    },
+    page_number: 1
+  }));
+
+  const result = await client.validateSubmission({
+    form_id: 1,
+    input_2: 'not-an-email',
+    input_3: 'Short'
+  });
+
+  TestAssert.isFalse(result.valid);
+  TestAssert.equal(result.validation_messages['2'], 'Email is invalid');
+  TestAssert.equal(result.page_number, 1);
+  TestAssert.isFalse('field_errors' in result, 'GF never returns field_errors — do not expose a dead field');
+});
+
+suite.test('Validate Submission: required-field failures come back in validation_messages', async () => {
+  mockHttpClient.setMockResponse('POST', '/forms/1/submissions/validation', new MockResponse({
+    is_valid: false,
+    validation_messages: { '1': 'This field is required' },
+    page_number: 1
+  }));
+
+  const result = await client.validateSubmission({
+    form_id: 1,
+    input_3: 'Only optional field filled'
+  });
+
+  TestAssert.isFalse(result.valid);
+  TestAssert.equal(result.validation_messages['1'], 'This field is required');
+});
+
+suite.test('Validate Submission: format failures come back in validation_messages', async () => {
+  mockHttpClient.setMockResponse('POST', '/forms/1/submissions/validation', new MockResponse({
+    is_valid: false,
+    validation_messages: {
+      '4': 'Please enter a valid phone number',
+      '5': 'Please enter a valid URL'
+    },
+    page_number: 1
+  }));
+
+  const result = await client.validateSubmission({
+    form_id: 1,
+    input_4: '123',
+    input_5: 'not-a-url'
+  });
+
+  TestAssert.isFalse(result.valid);
+  TestAssert.includes(result.validation_messages['4'], 'phone');
+  TestAssert.includes(result.validation_messages['5'], 'URL');
+});
+
+// gf_validate_form is the sibling of gf_validate_submission and must behave the
+// same way: validate WITHOUT creating an entry. It previously POSTed
+// {validation_only:true} to /submissions — a flag GF ignores — so it really
+// submitted (created an entry + fired notifications/feeds). It must use the
+// dedicated /submissions/validation route and return GF's 400 invalid body.
+suite.test('Validate Form: posts to the dedicated /validation route, never the submit route (no entry created)', async () => {
+  mockHttpClient.setMockResponse('POST', '/forms/1/submissions/validation', new MockResponse({
+    is_valid: true,
+    validation_messages: {},
+    page_number: 0
+  }));
+
+  const result = await client.validateForm({ form_id: 1, input_1: 'John Doe' });
+
+  const req = mockHttpClient.getRequests().find(r => r.method === 'POST');
+  TestAssert.equal(req.path, '/forms/1/submissions/validation');
+  TestAssert.isFalse('validation_only' in (req.config.data || {}), 'must not send a validation_only flag');
+  TestAssert.isTrue(result.valid);
+});
+
+suite.test('Validate Form: returns validation_messages on an invalid (400) submission instead of throwing', async () => {
+  mockHttpClient.setMockResponse('POST', '/forms/1/submissions/validation', new MockResponse({
+    is_valid: false,
+    validation_messages: { '1': 'This field is required.' },
+    page_number: 1
+  }, 400));
+
+  const result = await client.validateForm({ form_id: 1, input_2: 'x' });
+
+  TestAssert.isFalse(result.valid);
+  TestAssert.equal(result.validation_messages['1'], 'This field is required.');
+});
+
+// =================================
+// SEND NOTIFICATIONS TESTS
+// =================================
+
+suite.test('Send Notifications: no ids → send all-by-event; reads GF bare-array response', async () => {
+  // GF returns a bare array of sent notification ids.
+  mockHttpClient.setMockResponse('POST', '/entries/100/notifications', new MockResponse(
+    ['admin_notification', 'user_notification']
+  ));
+
+  const result = await client.sendNotifications({ entry_id: 100 });
+
+  const req = mockHttpClient.getRequests().find(r => r.method === 'POST');
+  TestAssert.isFalse('notification_ids' in (req.config.data || {}), 'GF does not read notification_ids');
+  TestAssert.isTrue(result.sent);
+  TestAssert.lengthOf(result.notifications_sent, 2);
+});
+
+suite.test('Send Notifications: specific ids go out as GF _notifications (comma string) query param', async () => {
+  mockHttpClient.setMockResponse('POST', '/entries/100/notifications', new MockResponse(['admin_notification']));
+
+  const result = await client.sendNotifications({
+    entry_id: 100,
+    notification_ids: ['admin_notification', 'user_notification']
+  });
+
+  const params = mockHttpClient.getRequests().find(r => r.method === 'POST').config.params || {};
+  TestAssert.equal(params._notifications, 'admin_notification,user_notification');
+  TestAssert.isTrue(result.sent);
+  TestAssert.lengthOf(result.notifications_sent, 1);
+});
+
+suite.test('Send Notifications: forwards the GF _event query param', async () => {
+  mockHttpClient.setMockResponse('POST', '/entries/100/notifications', new MockResponse([]));
+
+  await client.sendNotifications({ entry_id: 100, event: 'form_save_email_requested' });
+
+  const params = mockHttpClient.getRequests().find(r => r.method === 'POST').config.params || {};
+  TestAssert.equal(params._event, 'form_save_email_requested');
+});
+
+suite.test('Send Notifications: multiple ids join into one comma string', async () => {
+  mockHttpClient.setMockResponse('POST', '/entries/100/notifications', new MockResponse(['n1', 'n2', 'n3']));
+
+  const result = await client.sendNotifications({
+    entry_id: 100,
+    notification_ids: ['n1', 'n2', 'n3']
+  });
+
+  const params = mockHttpClient.getRequests().find(r => r.method === 'POST').config.params || {};
+  TestAssert.equal(params._notifications, 'n1,n2,n3');
+  TestAssert.lengthOf(result.notifications_sent, 3);
+});
+
+suite.test('Send Notifications: Should require entry_id', async () => {
+  await TestAssert.throwsAsync(
+    () => client.sendNotifications({}),
+    'entry_id',
+    'Should require entry_id'
+  );
+});
+
+suite.test('Send Notifications: Should handle non-existent entry', async () => {
+  mockHttpClient.setMockResponse('POST', '/entries/999/notifications', new MockResponse(
+    { message: 'Entry not found' },
+    404
+  ));
+
+  await TestAssert.throwsAsync(
+    () => client.sendNotifications({ entry_id: 999 }),
+    'not found',
+    'Should handle non-existent entry'
+  );
+});
+
+// =================================
+// EDGE CASES AND FAILURE MODES
+// =================================
+
+suite.test('Edge Case: Should handle spam detection', async () => {
+  mockHttpClient.setMockResponse('POST', '/forms/1/submissions', new MockResponse({
+    is_valid: false,
+    validation_messages: {
+      'honeypot': 'Spam detected'
+    },
+    is_spam: true
+  }));
+
+  const result = await client.submitFormData({
+    form_id: 1,
+    input_1: 'Spam content',
+    gf_honeypot: 'filled' // Honeypot field filled
+  });
+
+  TestAssert.isFalse(result.success);
+  TestAssert.includes(result.validation_messages.honeypot, 'Spam');
+});
+
+suite.test('Edge Case: Should handle CAPTCHA validation', async () => {
+  mockHttpClient.setMockResponse('POST', '/forms/1/submissions', new MockResponse({
+    is_valid: false,
+    validation_messages: {
+      'captcha': 'The reCAPTCHA was invalid'
+    }
+  }));
+
+  const result = await client.submitFormData({
+    form_id: 1,
+    input_1: 'John',
+    'g-recaptcha-response': 'invalid-token'
+  });
+
+  TestAssert.isFalse(result.success);
+  TestAssert.includes(result.validation_messages.captcha, 'reCAPTCHA');
+});
+
+suite.test('Edge Case: Should handle save and continue', async () => {
+  mockHttpClient.setMockResponse('POST', '/forms/1/submissions', new MockResponse({
+    is_valid: true,
+    resume_token: 'abc123def456',
+    resume_url: 'https://example.com/form?gf_token=abc123def456',
+    saved: true
+  }));
+
+  const result = await client.submitFormData({
+    form_id: 1,
+    input_1: 'Partial data',
+    save: true
+  });
+
+  TestAssert.isTrue(result.success);
+  TestAssert.equal(result.resume_token, 'abc123def456');
+});
+
+suite.test('Failure Mode: Should handle payment validation errors', async () => {
+  mockHttpClient.setMockResponse('POST', '/forms/1/submissions', new MockResponse({
+    is_valid: false,
+    validation_messages: {
+      'creditcard': 'Credit card number is invalid',
+      'payment': 'Payment failed: Card declined'
+    }
+  }));
+
+  const result = await client.submitFormData({
+    form_id: 1,
+    input_cc: '4111111111111111',
+    input_cvv: '123'
+  });
+
+  TestAssert.isFalse(result.success);
+  TestAssert.includes(result.validation_messages.payment, 'declined');
+});
+
+suite.test('Failure Mode: Should handle notification sending failures', async () => {
+  mockHttpClient.setMockResponse('POST', '/entries/100/notifications', new MockResponse(
+    {
+      message: 'Failed to send notifications',
+      errors: ['SMTP connection failed']
+    },
+    500
+  ));
+
+  await TestAssert.throwsAsync(
+    () => client.sendNotifications({ entry_id: 100 }),
+    'Server error',
+    'Should handle notification failures'
+  );
+});
+
+suite.test('Failure Mode: Should handle form not found', async () => {
+  mockHttpClient.setMockResponse('POST', '/forms/999/submissions', new MockResponse(
+    { message: 'Form not found' },
+    404
+  ));
+
+  await TestAssert.throwsAsync(
+    () => client.submitFormData({ form_id: 999, input_1: 'Test' }),
+    'not found',
+    'Should handle form not found'
+  );
+});
+
+// Run tests when executed directly
+const isMain = process.argv[1] && import.meta.url.endsWith(process.argv[1].replace(/.*\//, ""));
+if (isMain) {
+suite.run().then(results => {
+  process.exit(results.failed > 0 ? 1 : 0);
+});
+
+}
+
+export default suite;

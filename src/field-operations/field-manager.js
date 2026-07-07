@@ -3,10 +3,16 @@
  * Handles field CRUD operations within REST API v2 constraints
  */
 
+import { createHash } from 'crypto';
+
 export class FieldManager {
   constructor(apiClient, fieldRegistry, validator) {
     this.api = apiClient;
     this.registry = fieldRegistry;
+    // Required collaborator — always a FieldAwareValidator from
+    // createFieldOperations(). It must implement getWarnings(field); a missing
+    // method should fail loudly (and is covered by a test) rather than be
+    // silently swallowed.
     this.validator = validator;
     this.dependencyTracker = null; // Will be injected
     this.positionEngine = null;    // Will be injected
@@ -21,45 +27,71 @@ export class FieldManager {
    * @returns {object} Field creation result with warnings
    */
   async addField(formId, fieldType, properties = {}, position = {}) {
-    // 1. Validate field type against registry
-    const fieldDef = this.registry[fieldType];
-    if (!fieldDef) {
-      throw new Error(`Unknown field type: ${fieldType}`);
+    if (typeof fieldType !== 'string' || fieldType.trim() === '') {
+      throw new Error('field_type is required and must be a non-empty string');
     }
+    // Parameter defaults only cover `undefined`; coerce an explicit null so
+    // adversarial input can't crash createField or the position engine.
+    properties = properties || {};
+    position = position || {};
 
-    // 2. Fetch current form via REST API
+    // The registry is an ENHANCEMENT source, not a gate. Known types get
+    // type-specific defaults and sub-inputs. Unknown types (third-party add-ons,
+    // GravityKit, custom fields) are still created (Gravity Forms accepts them on
+    // save), just without those extras. Callers can pass `inputs`/`choices`
+    // explicitly for custom compound/choice fields.
+    const fieldDef = this.registry[fieldType] || null;
+    const isKnownType = fieldDef !== null;
+
+    // Fetch current form via REST API
     const { form } = await this.api.getForm({ id: formId });
     
-    // 3. Generate unique integer field ID (max + 1 pattern)
+    // Generate unique integer field ID (max + 1 pattern)
     const fieldId = this.generateFieldId(form.fields || []);
     
-    // 4. Create field with type-specific defaults
-    const field = this.createField(fieldId, fieldType, properties, fieldDef);
-    
-    // 5. Generate compound sub-inputs if needed (address.1, name.3, etc.)
-    if (fieldDef.storage?.type === 'compound') {
+    // Create field with type-specific defaults (none for unknown types)
+    const field = this.createField(fieldId, fieldType, properties, fieldDef || {});
+
+    // Known compound types (address, name, …) regenerate sub-inputs from the
+    // registry, keyed off the generated field id. Otherwise caller-supplied
+    // `inputs` are kept, but their dotted sub-input ids are rebased onto the
+    // generated field id so the parent reference matches (mirrors assignFieldIds).
+    const isCompoundType = fieldDef?.storage?.type === 'compound';
+    if (isCompoundType) {
       field.inputs = this.generateSubInputs(field, fieldDef);
+    } else if (Array.isArray(field.inputs)) {
+      field.inputs = this.rebaseSubInputIds(field.inputs, fieldId);
     }
+
+    // Normalize layout grid properties (layoutGroupId, layoutGridColumnSpan)
+    this.normalizeLayoutProperties(field, formId);
     
-    // 6. Calculate insertion position (page-aware)
+    // Calculate insertion position (page-aware)
     const insertIndex = this.positionEngine?.calculatePosition(
       form.fields || [],
       position,
       form.pagination
     ) || form.fields?.length || 0;
     
-    // 7. Insert field at calculated position
+    // Insert field at calculated position
     if (!form.fields) form.fields = [];
     form.fields.splice(insertIndex, 0, field);
     
-    // 8. Replace form via direct PUT (no re-fetch — we already have the full state)
-    const updatedForm = await this.api.replaceForm(formId, form);
-    
-    // 9. Return result with validation warnings
+    // Replace form via direct PUT (no re-fetch; we already have the full state)
+    await this.api.replaceForm(formId, form);
+
+    // Surface field-shape warnings, plus a heads-up when the type is unrecognized.
+    const warnings = this.validator.getWarnings(field);
+    if (!isKnownType) {
+      warnings.unshift(
+        `Field type '${fieldType}' is not in the known field registry; created without type-specific defaults or sub-inputs. Pass 'inputs'/'choices' explicitly if this type needs them.`
+      );
+    }
+
     return {
       success: true,
       field: field,
-      warnings: this.validator?.getWarnings(field) || [],
+      warnings,
       form_id: formId,
       position: { 
         index: insertIndex, 
@@ -71,30 +103,46 @@ export class FieldManager {
   /**
    * Update existing field with dependency checking
    */
-  async updateField(formId, fieldId, updates = {}) {
+  async updateField(formId, fieldId, updates = {}, options = {}) {
+    const { force = false } = options;
+
     // Fetch form
     const { form } = await this.api.getForm({ id: formId });
-    
+
     // Find field
     const fieldIndex = form.fields?.findIndex(f => f.id == fieldId);
-    if (fieldIndex === -1) {
+    if (fieldIndex === undefined || fieldIndex === -1) {
       throw new Error(`Field ${fieldId} not found in form ${formId}`);
     }
-    
-    // Check dependencies
+
+    // Gate the write on dependencies BEFORE mutating, the way deleteField does.
+    // Saving first and reporting failure afterward persisted a "blocked" update
+    // and made the success:false response a lie.
     const dependencies = this.dependencyTracker?.scanFormDependencies(form, fieldId) || {};
-    
+    const hasBreakingDeps = dependencies.conditionalLogic?.length > 0;
+
+    if (hasBreakingDeps && !force) {
+      return {
+        success: false,
+        error: 'Field has dependencies that may be affected',
+        field_id: fieldId,
+        dependencies,
+        suggestion: 'Use force=true to update anyway'
+      };
+    }
+
     // Apply updates
     const originalField = { ...form.fields[fieldIndex] };
     form.fields[fieldIndex] = {
       ...originalField,
-      ...updates,
+      ...(updates || {}),
       id: originalField.id // Preserve ID
     };
+    this.normalizeLayoutProperties(form.fields[fieldIndex], formId);
 
-    // Replace form via direct PUT (no re-fetch — we already have the full state)
+    // Replace form via direct PUT (no re-fetch; we already have the full state)
     const result = await this.api.replaceForm(formId, form);
-    
+
     return {
       success: true,
       field: result.form.fields[fieldIndex],
@@ -103,9 +151,8 @@ export class FieldManager {
         after: result.form.fields[fieldIndex]
       },
       warnings: {
-        dependencies: dependencies.conditionalLogic?.length > 0 ? 
-          ['Field has conditional logic dependencies'] : [],
-        validationIssues: this.validator?.getWarnings(result.form.fields[fieldIndex]) || []
+        dependencies: hasBreakingDeps ? ['Field has conditional logic dependencies'] : [],
+        validationIssues: this.validator.getWarnings(result.form.fields[fieldIndex])
       }
     };
   }
@@ -182,6 +229,26 @@ export class FieldManager {
   }
 
   /**
+   * Rebase dotted sub-input ids (e.g. "9.1") onto a new parent field id so each
+   * sub-input's parent reference matches the field it belongs to. Non-dotted and
+   * non-string ids pass through. Mirrors assignFieldIds in the field registry.
+   *
+   * @param {Array<object>} inputs
+   * @param {number|string} baseId
+   * @returns {Array<object>}
+   */
+  rebaseSubInputIds(inputs, baseId) {
+    return inputs.map((input) => {
+      const hasDottedId = input && typeof input.id === 'string' && input.id.includes('.');
+      if (!hasDottedId) {
+        return input;
+      }
+      const sub = input.id.slice(input.id.indexOf('.') + 1);
+      return { ...input, id: `${baseId}.${sub}` };
+    });
+  }
+
+  /**
    * Create field with intelligent defaults from registry
    */
   createField(id, type, properties, fieldDef) {
@@ -198,6 +265,46 @@ export class FieldManager {
       ...this.getTypeSpecificDefaults(type, fieldDef),
       ...properties
     };
+  }
+
+  /**
+   * Normalize layout grid properties to the editor's storage format.
+   *
+   * Mirrors the server-side normalization Gravity Forms ships in its
+   * abilities API (GF_Abilities_Handler_Forms::normalize_layout_group_ids):
+   * the editor stores layoutGroupId as an 8-char lowercase hex string, but
+   * agents naturally write friendly names like "row1" or "name-row".
+   * Friendly names hash to a stable 8-char hex per form, so the same name
+   * passed to later calls lands the field in the same row (GF salts per
+   * request because it normalizes a whole form at once; we normalize one
+   * field per call, so determinism is what makes row-sharing work).
+   *
+   * layoutGridColumnSpan is clamped to the editor's 1-12 grid; non-numeric
+   * values are dropped so the editor assigns its own span.
+   *
+   * Mutates and returns the field.
+   */
+  normalizeLayoutProperties(field, formId) {
+    if (typeof field.layoutGridColumnSpan !== 'undefined') {
+      const raw = field.layoutGridColumnSpan;
+      // Accept only true integers / integer strings — Number() (not parseInt)
+      // so "6.5" and "6wide" become NaN instead of being truncated to 6, and
+      // empty/whitespace strings are rejected rather than coerced to 0.
+      const numeric = typeof raw === 'number' || (typeof raw === 'string' && raw.trim() !== '');
+      const span = numeric ? Number(raw) : NaN;
+      if (Number.isInteger(span)) {
+        field.layoutGridColumnSpan = Math.min(12, Math.max(1, span));
+      } else {
+        delete field.layoutGridColumnSpan;
+      }
+    }
+
+    const groupId = field.layoutGroupId;
+    if (typeof groupId === 'string' && groupId !== '' && !/^[0-9a-f]{8}$/.test(groupId)) {
+      field.layoutGroupId = createHash('md5').update(`${formId}:${groupId}`).digest('hex').slice(0, 8);
+    }
+
+    return field;
   }
 
   /**
@@ -252,17 +359,41 @@ export class FieldManager {
       }
     }
     
-    // Credit card field sub-inputs
+    // Credit card field sub-inputs. GF's field defines five form inputs:
+    // .1 Card Number, .2 Expiration, .3 Security Code, .4 Card Type, .5
+    // Cardholder Name. Only .1 (masked number) and .4 (card type) are persisted
+    // to the entry. (class-gf-field-creditcard.php get_field_input /
+    // get_entry_inputs.)
     else if (field.type === 'creditcard') {
       subInputs.push(
         { id: `${baseId}.1`, label: 'Card Number', name: '' },
         { id: `${baseId}.2`, label: 'Expiration Date', name: '' },
         { id: `${baseId}.3`, label: 'Security Code', name: '' },
-        { id: `${baseId}.4`, label: 'Cardholder Name', name: '' },
-        { id: `${baseId}.5`, label: 'Card Type', name: '' }
+        { id: `${baseId}.4`, label: 'Card Type', name: '' },
+        { id: `${baseId}.5`, label: 'Cardholder Name', name: '' }
       );
     }
-    
+
+    // Chained Select sub-inputs — one dropdown level per sub-input. Validated
+    // against the GF Chained Selects add-on (class-gf-field-chainedselect.php
+    // import_choices / get_default_inputs): sub-input ids are baseId.N, counted
+    // 1,2,…,9,11,12,… SKIPPING multiples of 10 (the .10/.20 slots are reserved),
+    // each labelled by its column/level. A fresh field defaults to two levels
+    // ("Parents" / "Children"). The level definitions come from any inputs the
+    // caller supplied; otherwise the add-on default is used.
+    else if (field.type === 'chainedselect') {
+      const hasConfiguredLevels = Array.isArray(field.inputs) && field.inputs.length > 0;
+      const levels = hasConfiguredLevels
+        ? field.inputs
+        : [{ label: 'Parents' }, { label: 'Children' }];
+      let position = 1;
+      for (const level of levels) {
+        if (position % 10 === 0) position++; // GF reserves .10/.20/… — skip them
+        subInputs.push({ id: `${baseId}.${position}`, label: level.label || '', name: level.name || '' });
+        position++;
+      }
+    }
+
     return subInputs;
   }
 
