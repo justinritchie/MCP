@@ -327,7 +327,9 @@ GRAVITYKIT_WP_USERNAME=wp_username
 GRAVITYKIT_WP_APP_PASSWORD="xxxx xxxx xxxx xxxx xxxx xxxx"
 ```
 
-`WordPressClient` resolves the base URL from `GRAVITYKIT_WP_URL` or `GRAVITY_FORMS_BASE_URL`, and credentials from `GRAVITYKIT_WP_*` or the `GRAVITY_FORMS_CONSUMER_KEY`/`SECRET` fallback. On most single-site setups the GF credentials already double as the WP app password, so no extra config is needed.
+`WordPressClient` resolves the base URL from `GRAVITYKIT_WP_URL` → `WORDPRESS_LOCAL_DEV_TEST_URL` → `GRAVITY_FORMS_BASE_URL`, and credentials from `GRAVITYKIT_WP_*` → `WORDPRESS_LOCAL_DEV_TEST_ADMIN_*` → `WP_USERNAME`/`WP_APP_PASSWORD` → the `GRAVITY_FORMS_CONSUMER_KEY`/`SECRET` fallback (`src/wp-client.js` `resolveBaseUrl()` + constructor). On most single-site setups the GF credentials already double as the WP app password, so no extra config is needed.
+
+- **Gotcha — pointing the abilities plane at a LOCAL site: pin `GRAVITYKIT_WP_URL`/`_USERNAME`/`_APP_PASSWORD`, not just `GRAVITY_FORMS_*`.** The middle of each resolution chain is `WORDPRESS_LOCAL_DEV_TEST_*`, which `~/.monokit/.env` sets to `https://dev.test` (dotenv-loaded and inherited by the MCP process). It **outranks** `GRAVITY_FORMS_BASE_URL`, so a config that pins only the GF vars silently sends the abilities plane to `dev.test` (→ 502 → **0 `gv_*` tools**) while `gf_*` still works against the intended site — a plane-specific misroute that looks like "abilities just won't load." Verified 2026-07-12 wiring to a Siteminter site. [gotcha]
 
 ### Optional Environment
 
