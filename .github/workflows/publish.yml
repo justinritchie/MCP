@@ -115,7 +115,9 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           if [ -z "${SLACK_RELEASE_NOTIFICATION_WEBHOOK:-}" ]; then
-            echo "SLACK_RELEASE_NOTIFICATION_WEBHOOK not set — skipping Slack announcement."
+            # A warning, not a silent echo: the secret was absent through v2.4.1
+            # and every release skipped the announcement without surfacing it.
+            echo "::warning::SLACK_RELEASE_NOTIFICATION_WEBHOOK is not set — v$VERSION was NOT announced in #release-announcements. Add the secret to GravityKit/MCP to restore it."
             exit 0
           fi
           LINK="https://github.com/$REPO/releases/tag/v$VERSION"
