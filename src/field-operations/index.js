@@ -51,18 +51,21 @@ export const fieldOperationHandlers = {
    * Add field to form
    */
   async gf_add_field(params, { fieldManager }) {
-    const { form_id, field_type, properties = {}, position = {} } = params;
+    const { form_id, field_type, properties = {}, position = {}, test_mode = false } = params;
 
     const result = await fieldManager.addField(
       form_id,
       field_type,
       properties,
-      position
+      position,
+      { testMode: test_mode }
     );
 
+    // Spread result LAST so its test_mode/persisted/success survive; the
+    // literal success:true above would otherwise mask a failure shape.
     return {
-      success: true,
-      ...result
+      ...result,
+      success: result.success !== false
     };
   },
 
@@ -70,23 +73,29 @@ export const fieldOperationHandlers = {
    * Update field properties
    */
   async gf_update_field(params, { fieldManager }) {
-    const { form_id, field_id, properties, force = false } = params;
+    // test_mode MUST be destructured here. It was declared in the inputSchema
+    // below but never read, so every "dry run" wrote to the live form while
+    // reporting a preview.
+    const { form_id, field_id, properties, force = false, test_mode = false } = params;
 
     // updateField gates the write on dependencies and returns the final
     // success/failure shape; it no longer saves before reporting a block.
-    return fieldManager.updateField(form_id, field_id, properties, { force });
+    return fieldManager.updateField(form_id, field_id, properties, {
+      force,
+      testMode: test_mode
+    });
   },
 
   /**
    * Delete field with dependency checking
    */
   async gf_delete_field(params, { fieldManager }) {
-    const { form_id, field_id, cascade = false, force = false } = params;
+    const { form_id, field_id, cascade = false, force = false, test_mode = false } = params;
 
     const result = await fieldManager.deleteField(
       form_id,
       field_id,
-      { cascade, force }
+      { cascade, force, testMode: test_mode }
     );
 
     return result;
@@ -275,7 +284,7 @@ export const fieldOperationTools = [
         },
         test_mode: {
           type: 'boolean',
-          description: 'Test mode',
+          description: 'DRY RUN. Computes and returns the full before/after WITHOUT writing. The response carries persisted:false. Re-send the identical payload without test_mode to apply.',
           default: false
         }
       },
@@ -308,7 +317,7 @@ export const fieldOperationTools = [
         },
         test_mode: {
           type: 'boolean',
-          description: 'Test mode',
+          description: 'DRY RUN. Computes and returns the full before/after WITHOUT writing. The response carries persisted:false. Re-send the identical payload without test_mode to apply.',
           default: false
         }
       },
@@ -342,7 +351,7 @@ export const fieldOperationTools = [
         },
         test_mode: {
           type: 'boolean',
-          description: 'Test mode',
+          description: 'DRY RUN. Computes and returns the full before/after WITHOUT writing. The response carries persisted:false. Re-send the identical payload without test_mode to apply.',
           default: false
         }
       },

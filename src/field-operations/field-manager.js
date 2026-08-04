@@ -26,7 +26,8 @@ export class FieldManager {
    * @param {object} position - Positioning configuration
    * @returns {object} Field creation result with warnings
    */
-  async addField(formId, fieldType, properties = {}, position = {}) {
+  async addField(formId, fieldType, properties = {}, position = {}, options = {}) {
+    const { testMode = false } = options;
     if (typeof fieldType !== 'string' || fieldType.trim() === '') {
       throw new Error('field_type is required and must be a non-empty string');
     }
@@ -77,9 +78,6 @@ export class FieldManager {
     if (!form.fields) form.fields = [];
     form.fields.splice(insertIndex, 0, field);
     
-    // Replace form via direct PUT (no re-fetch; we already have the full state)
-    await this.api.replaceForm(formId, form);
-
     // Surface field-shape warnings, plus a heads-up when the type is unrecognized.
     const warnings = this.validator.getWarnings(field);
     if (!isKnownType) {
@@ -88,14 +86,35 @@ export class FieldManager {
       );
     }
 
+    // DRY RUN — see the note in updateField. Computed before the PUT so the
+    // preview shows the real constructed field (id assignment, registry
+    // defaults, sub-inputs) rather than just echoing the caller's properties.
+    if (testMode) {
+      return {
+        success: true,
+        test_mode: true,
+        persisted: false,
+        field: field,
+        warnings,
+        form_id: formId,
+        position: { index: insertIndex, page: field.pageNumber || 1 },
+        note: 'DRY RUN — nothing was written. Re-send without test_mode to apply.'
+      };
+    }
+
+    // Replace form via direct PUT (no re-fetch; we already have the full state)
+    await this.api.replaceForm(formId, form);
+
     return {
       success: true,
+      test_mode: false,
+      persisted: true,
       field: field,
       warnings,
       form_id: formId,
-      position: { 
-        index: insertIndex, 
-        page: field.pageNumber || 1 
+      position: {
+        index: insertIndex,
+        page: field.pageNumber || 1
       }
     };
   }
@@ -104,7 +123,7 @@ export class FieldManager {
    * Update existing field with dependency checking
    */
   async updateField(formId, fieldId, updates = {}, options = {}) {
-    const { force = false } = options;
+    const { force = false, testMode = false } = options;
 
     // Fetch form
     const { form } = await this.api.getForm({ id: formId });
@@ -140,11 +159,45 @@ export class FieldManager {
     };
     this.normalizeLayoutProperties(form.fields[fieldIndex], formId);
 
+    // DRY RUN — return the computed result WITHOUT the PUT.
+    //
+    // test_mode was previously declared in the tool schema (with a default, so
+    // it looked implemented) but never read by any handler. Passing
+    // test_mode:true returned an accurate-looking `changes` block AND wrote the
+    // field. That is the worst possible behaviour for this flag: it is what a
+    // caller reaches for precisely when they are unsure about a payload on a
+    // live client site. Reproduced Aug 3 2026 on aarlocal form 1 field 17.
+    //
+    // The check sits here rather than in the handler so every caller of
+    // updateField inherits it, and deliberately AFTER the mutation is computed
+    // so the preview reflects normalizeLayoutProperties too — a dry run that
+    // skipped normalisation would preview something the real write would not
+    // produce.
+    if (testMode) {
+      return {
+        success: true,
+        test_mode: true,
+        persisted: false,
+        field: form.fields[fieldIndex],
+        changes: {
+          before: originalField,
+          after: form.fields[fieldIndex]
+        },
+        warnings: {
+          dependencies: hasBreakingDeps ? ['Field has conditional logic dependencies'] : [],
+          validationIssues: this.validator.getWarnings(form.fields[fieldIndex])
+        },
+        note: 'DRY RUN — nothing was written. Re-send without test_mode to apply.'
+      };
+    }
+
     // Replace form via direct PUT (no re-fetch; we already have the full state)
     const result = await this.api.replaceForm(formId, form);
 
     return {
       success: true,
+      test_mode: false,
+      persisted: true,
       field: result.form.fields[fieldIndex],
       changes: {
         before: originalField,
@@ -161,7 +214,7 @@ export class FieldManager {
    * Delete field with comprehensive dependency analysis
    */
   async deleteField(formId, fieldId, options = {}) {
-    const { cascade = false, force = false } = options;
+    const { cascade = false, force = false, testMode = false } = options;
     
     // Fetch form
     const { form } = await this.api.getForm({ id: formId });
@@ -199,11 +252,34 @@ export class FieldManager {
       this.cleanupDependencies(form, fieldId);
     }
     
+    // DRY RUN — see the note in updateField. test_mode was a phantom parameter
+    // on this tool too, which is worse here than anywhere else: a caller
+    // sanity-checking a DELETE against a live client form got a confident
+    // report and a deleted field.
+    if (testMode) {
+      return {
+        success: true,
+        test_mode: true,
+        persisted: false,
+        would_delete_field: {
+          id: field.id,
+          type: field.type,
+          label: field.label
+        },
+        remaining_field_count: form.fields.length,
+        dependencies,
+        actions_would_take: cascade ? ['Dependencies cleaned up'] : [],
+        note: 'DRY RUN — nothing was deleted. Re-send without test_mode to apply.'
+      };
+    }
+
     // Replace form via direct PUT (no re-fetch — we already have the full state)
     await this.api.replaceForm(formId, form);
 
     return {
       success: true,
+      test_mode: false,
+      persisted: true,
       deleted_field: {
         id: field.id,
         type: field.type,
