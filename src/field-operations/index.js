@@ -102,6 +102,29 @@ export const fieldOperationHandlers = {
   },
 
   /**
+   * Retitle specific choices by choice VALUE, without resending the array.
+   */
+  async gf_set_choice_text(params, { fieldManager }) {
+    const { form_id, field_id, texts, dry_run = false } = params;
+
+    // The sibling field tools spell this flag `test_mode`; this one is
+    // `dry_run`. A caller coming off gf_update_field will reach for test_mode
+    // from muscle memory, and an unknown property is silently ignored — so they
+    // would get a LIVE WRITE while believing they asked for a preview. That is
+    // the phantom-parameter bug all over again, just spelled differently.
+    // Refuse the call rather than write.
+    if (params && Object.prototype.hasOwnProperty.call(params, 'test_mode')) {
+      throw new Error(
+        'gf_set_choice_text takes `dry_run`, not `test_mode` (test_mode is the flag on '
+        + 'gf_add_field / gf_update_field / gf_delete_field). Nothing was written. '
+        + 'Re-send with dry_run instead.'
+      );
+    }
+
+    return fieldManager.setChoiceText(form_id, field_id, texts, { dryRun: dry_run });
+  },
+
+  /**
    * List available field types
    */
   async gf_list_field_types(params, { fieldRegistry }) {
@@ -356,6 +379,60 @@ export const fieldOperationTools = [
         }
       },
       required: ['form_id', 'field_id']
+    }
+  },
+  {
+    name: 'gf_set_choice_text',
+    description:
+      'Change the LABEL TEXT of specific choices on a choice field (radio, select, checkbox, multiselect), '
+      + 'matched by choice VALUE. Merges into the existing choices: it writes `text` and nothing else. '
+      + '`value`, `isSelected`, `price` and `inventory_limit` — plus any add-on keys — are carried through '
+      + 'untouched, and the write is verified against the saved form afterwards (protected_fields_unchanged).\n\n'
+      + 'USE THIS INSTEAD OF gf_update_field whenever you only need to change what a choice SAYS.\n\n'
+      + 'Why it exists: gf_update_field takes the ENTIRE choices array, so changing one label means retyping '
+      + "every choice's `text` AND every choice's `value`. On a registration form the `text` is presentation "
+      + 'HTML while the `value` is a routing key — it selects the confirmation page, the confirmation email '
+      + 'and the user meta written on submit. A typo in the label HTML breaks layout visibly and gets caught. '
+      + 'A typo in a `value` breaks confirmation routing SILENTLY: the registrant lands on a fallback page and '
+      + 'nobody notices until a client tests it. Retyping that payload to change a label is a loaded gun. '
+      + 'This tool exists so routing keys never ride along in a write.\n\n'
+      + '`texts` is keyed by choice VALUE, not by label: {"Concord": "<span class=\\"aar-date\\">…</span>"}. '
+      + 'A key matching no existing choice value is a HARD ERROR and nothing is written — that surfaces a typo '
+      + "like \"Concorde\" instead of silently no-op'ing. Conditional logic keys off `value`, which this cannot "
+      + 'change, so a label-only edit cannot break a conditional rule.',
+    annotations: { idempotentHint: true, openWorldHint: true },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        form_id: {
+          type: 'number',
+          description: 'Form ID'
+        },
+        field_id: {
+          type: 'number',
+          description: 'Field ID of the choice field (radio, select, checkbox, multiselect)'
+        },
+        texts: {
+          type: 'object',
+          description:
+            'Map of choice VALUE -> new label text/HTML, e.g. {"Concord": "<span>Tuesday</span> · <span>Concord, NC</span>"}. '
+            + 'Only the listed choices are touched; every other choice is left exactly as it is. '
+            + 'Keys are the choice VALUE (the routing key), NOT the current label. A key that matches no '
+            + 'choice value errors out and nothing is written. Read the field first (gf_get_form) if you are '
+            + 'not certain of the values.',
+          additionalProperties: { type: 'string' }
+        },
+        dry_run: {
+          type: 'boolean',
+          description:
+            'DRY RUN. Computes and returns the full before/after for every targeted choice WITHOUT writing. '
+            + 'The response carries persisted:false. Re-send the identical payload without dry_run to apply. '
+            + 'Note the spelling: this tool takes `dry_run`; gf_add_field / gf_update_field / gf_delete_field '
+            + 'take `test_mode`. Passing test_mode here is rejected rather than ignored.',
+          default: false
+        }
+      },
+      required: ['form_id', 'field_id', 'texts']
     }
   },
   {

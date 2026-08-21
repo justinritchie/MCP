@@ -952,6 +952,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
         return await fieldOperationHandlers.gf_delete_field(params, fieldOperations);
       }, params)();
+    case 'gf_set_choice_text':
+      return wrapHandler(async () => {
+        if (!fieldOperations) {
+          throw new Error('Field operations not initialized');
+        }
+        return await fieldOperationHandlers.gf_set_choice_text(params, fieldOperations);
+      }, params)();
     case 'gf_list_field_types':
       return wrapHandler(async () => {
         if (!fieldOperations) {

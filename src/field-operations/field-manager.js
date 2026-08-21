@@ -291,6 +291,176 @@ export class FieldManager {
   }
 
   /**
+   * Retitle specific choices on a choice field, matched by choice VALUE.
+   *
+   * WHY THIS IS NOT gf_update_field
+   * -------------------------------
+   * updateField takes a whole `choices` array, so changing one label means
+   * resending every choice's `text` AND every choice's `value`. On a live
+   * registration form the `text` is presentation HTML while the `value` is a
+   * routing key — it selects the confirmation page, the notification routing and
+   * the user meta written on submit. A typo in the HTML is visible immediately;
+   * a typo in a `value` breaks routing SILENTLY. Retyping that payload to change
+   * a label is a loaded gun. Here the routing keys are read, never written.
+   *
+   * The guarantee is structural, not a promise: each targeted choice is rebuilt
+   * as `{ ...choice, text }`, so `value`, `isSelected`, `price`,
+   * `inventory_limit` and every add-on key ride through untouched, and
+   * non-targeted choices are passed through by reference. Unlike updateField
+   * this deliberately does NOT run normalizeLayoutProperties — the field is
+   * written back exactly as it was read, except for the labels asked for.
+   *
+   * No dependency gate: conditional logic keys off `value`, which this cannot
+   * change, so a label-only edit cannot break a rule.
+   *
+   * @param {number} formId
+   * @param {number} fieldId
+   * @param {Record<string,string>} texts - keyed by choice VALUE
+   * @param {{dryRun?: boolean}} options
+   */
+  async setChoiceText(formId, fieldId, texts, options = {}) {
+    const { dryRun = false } = options;
+
+    if (!texts || typeof texts !== 'object' || Array.isArray(texts)) {
+      throw new Error('texts must be an object keyed by choice VALUE, e.g. {"Concord": "<span>…</span>"}.');
+    }
+    const keys = Object.keys(texts);
+    if (keys.length === 0) {
+      throw new Error('texts is empty — nothing to do. Pass at least one {choiceValue: newLabelHtml} pair.');
+    }
+    const nonString = keys.filter((k) => typeof texts[k] !== 'string');
+    if (nonString.length > 0) {
+      throw new Error(
+        `Every value in texts must be a string (the new label HTML). Not strings: ${nonString.join(', ')}.`
+      );
+    }
+
+    const { form } = await this.api.getForm({ id: formId });
+    const fieldIndex = form.fields?.findIndex((f) => f.id == fieldId);
+    if (fieldIndex === undefined || fieldIndex === -1) {
+      throw new Error(`Field ${fieldId} not found in form ${formId}`);
+    }
+    const field = form.fields[fieldIndex];
+
+    if (!Array.isArray(field.choices) || field.choices.length === 0) {
+      throw new Error(
+        `Field ${fieldId} in form ${formId} is a '${field.type}' field with no choices, so it has no choice text to set.`
+      );
+    }
+
+    // A key that matches nothing is a TYPO, not a no-op. Fail before the write
+    // and name the valid values, so "Concorde" surfaces as an error instead of
+    // reporting success while changing nothing.
+    const presentValues = field.choices.map((c) => String(c.value));
+    const unmatched = keys.filter((k) => !presentValues.includes(k));
+    if (unmatched.length > 0) {
+      throw new Error(
+        `No choice on field ${fieldId} (form ${formId}) has value ${unmatched.map((v) => `'${v}'`).join(', ')}. `
+        + `Nothing was written. Choice values on this field: ${presentValues.map((v) => `'${v}'`).join(', ')}. `
+        + 'texts is keyed by choice VALUE (the routing key), not by the label text.'
+      );
+    }
+
+    // Two choices sharing a targeted value makes "the choice with value X"
+    // ambiguous. Refuse rather than guess which one the caller meant.
+    const ambiguous = keys.filter((k) => presentValues.filter((v) => v === k).length > 1);
+    if (ambiguous.length > 0) {
+      throw new Error(
+        `Field ${fieldId} in form ${formId} has more than one choice with value `
+        + `${ambiguous.map((v) => `'${v}'`).join(', ')}, so matching by value is ambiguous. Nothing was written.`
+      );
+    }
+
+    const PROTECTED_KEYS = ['value', 'isSelected', 'price', 'inventory_limit'];
+    const changes = [];
+    const guardBefore = {};
+
+    const nextChoices = field.choices.map((choice) => {
+      const key = String(choice.value);
+      if (!Object.prototype.hasOwnProperty.call(texts, key)) return choice; // untouched
+      guardBefore[key] = PROTECTED_KEYS.map((k) => JSON.stringify(choice[k])).join(' ');
+      changes.push({
+        value: choice.value,
+        before: choice.text,
+        after: texts[key],
+        changed: choice.text !== texts[key]
+      });
+      // Only `text` is overwritten. Everything else — including keys this code
+      // has never heard of — is carried over by the spread.
+      return { ...choice, text: texts[key] };
+    });
+
+    const summary = {
+      success: true,
+      form_id: formId,
+      field_id: field.id,
+      field_label: field.label,
+      choices_total: field.choices.length,
+      choices_targeted: changes.length,
+      choices_actually_changed: changes.filter((c) => c.changed).length,
+      changes
+    };
+
+    if (dryRun) {
+      return {
+        ...summary,
+        dry_run: true,
+        persisted: false,
+        note: 'DRY RUN — nothing was written. Re-send the identical payload without dry_run to apply.'
+      };
+    }
+
+    form.fields[fieldIndex] = { ...field, choices: nextChoices };
+    const result = await this.api.replaceForm(formId, form);
+
+    // Post-write guard. The entire point of this tool is that routing keys never
+    // ride along in a write, so prove it from what came BACK rather than from
+    // what was sent. Free — replaceForm returns the saved form.
+    const saved = result?.form?.fields?.find((f) => f.id == fieldId);
+    const guardMismatches = [];
+    if (saved && Array.isArray(saved.choices)) {
+      for (const choice of saved.choices) {
+        const key = String(choice.value);
+        if (!(key in guardBefore)) continue;
+        const after = PROTECTED_KEYS.map((k) => JSON.stringify(choice[k])).join(' ');
+        if (after !== guardBefore[key]) {
+          guardMismatches.push({
+            value: choice.value,
+            expected: guardBefore[key].split(' '),
+            actual: after.split(' '),
+            protected_keys: PROTECTED_KEYS
+          });
+        }
+      }
+    }
+
+    if (guardMismatches.length > 0) {
+      return {
+        ...summary,
+        success: false,
+        dry_run: false,
+        persisted: true,
+        protected_fields_unchanged: false,
+        guard_mismatches: guardMismatches,
+        error:
+          'The write landed but a protected choice key changed. This tool must never alter '
+          + `value/isSelected/price/inventory_limit. Inspect field ${fieldId} on form ${formId} `
+          + 'immediately — confirmation routing keys off `value`.'
+      };
+    }
+
+    return {
+      ...summary,
+      dry_run: false,
+      persisted: true,
+      // Verified against the saved form, not the sent payload. `null` means the
+      // API returned no form to check, so the claim is unproven rather than true.
+      protected_fields_unchanged: saved ? true : null,
+      protected_keys: PROTECTED_KEYS
+    };
+  }
+
+  /**
    * Generate unique integer field ID using max+1 pattern
    */
   generateFieldId(existingFields) {

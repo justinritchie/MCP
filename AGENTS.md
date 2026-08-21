@@ -1,6 +1,6 @@
 # AGENTS.md — GravityKit MCP
 
-> MCP server for Gravity Forms (primary) and GravityKit products (secondary). It exposes 26 always-on Gravity Forms tools plus a dynamic set of GravityKit product tools generated from the connected site's Foundation Abilities catalog — GravityView is the only GravityKit product implemented so far.
+> MCP server for Gravity Forms (primary) and GravityKit products (secondary). It exposes 27 always-on Gravity Forms tools plus a dynamic set of GravityKit product tools generated from the connected site's Foundation Abilities catalog — GravityView is the only GravityKit product implemented so far.
 
 This is the single canonical doc for the project (agents and humans). `CLAUDE.md` simply re-exports it via `@AGENTS.md`.
 
@@ -8,14 +8,14 @@ This is the single canonical doc for the project (agents and humans). `CLAUDE.md
 
 - **Package:** `@gravitykit/mcp` v2.4.1
 - **Type:** Node.js MCP server (ESM)
-- **Purpose:** Full Gravity Forms REST API v2 coverage (26 Gravity Forms tools), plus dynamic GravityKit product tools (GravityView so far) via the WordPress Abilities API
+- **Purpose:** Full Gravity Forms REST API v2 coverage (27 Gravity Forms tools), plus dynamic GravityKit product tools (GravityView so far) via the WordPress Abilities API
 - **Repo:** https://github.com/GravityKit/MCP
 
 ## Quick Start
 
 **What this is:** A Node.js MCP (Model Context Protocol) server with two independent capability planes:
 
-- **Plane A — Gravity Forms (`gf_*`), primary.** 26 static tools wrapping the Gravity Forms REST API v2 (forms, entries, feeds, notifications, submissions, field filters, results, and intelligent field management). Always available when Gravity Forms REST credentials work — on any Gravity Forms site.
+- **Plane A — Gravity Forms (`gf_*`), primary.** 27 static tools wrapping the Gravity Forms REST API v2 (forms, entries, feeds, notifications, submissions, field filters, results, and intelligent field management). Always available when Gravity Forms REST credentials work — on any Gravity Forms site.
 - **Plane B — GravityKit, secondary.** Tools generated at runtime from the connected site's GravityKit Foundation Abilities catalog; each product registers tools under its own server-owned prefix. They appear only when Foundation is active. GravityView is the only product wired up so far, using the `gv_*` prefix (View authoring, fields, widgets, search, layouts). The plane is product-agnostic: any GravityKit product that registers Foundation abilities shows up automatically under its own prefix.
 
 The two planes are independent: a GF-only site gets the full `gf_*` surface with no abilities; a GravityKit site without GF REST keys still gets its GravityKit tools.
@@ -96,7 +96,7 @@ MCP/
 
 The server registers tools from two independent sources, initialized separately so a failure in one never blocks the other:
 
-- **Plane A — Gravity Forms (`gf_*`).** Static tool definitions in `src/index.js` (`GF_TOOL_DEFINITIONS`) plus the field tools from `src/field-operations/index.js` (`fieldOperationTools`). Backed by `GravityFormsClient` against the GF REST API v2. 26 tools, always present once GF credentials validate.
+- **Plane A — Gravity Forms (`gf_*`).** Static tool definitions in `src/index.js` (`GF_TOOL_DEFINITIONS`) plus the field tools from `src/field-operations/index.js` (`fieldOperationTools`). Backed by `GravityFormsClient` against the GF REST API v2. 27 tools, always present once GF credentials validate.
 - **Plane B — GravityKit.** Generated at runtime by `src/abilities/loader.js` from the connected site's Abilities catalog, backed by `WordPressClient`; each product's tools carry its own prefix (GravityView → `gv_*`). The catalog is fetched in the background after startup; tools appear once it loads (the server advertises `tools.listChanged`). A single built-in tool, `gk_reload_abilities`, forces a re-fetch.
 
 ### Initialization Flow
@@ -151,7 +151,7 @@ Responses are optimized for minimal token usage:
 
 ### Tool Categories
 
-**Plane A — Gravity Forms (`gf_*`), 26 static tools:**
+**Plane A — Gravity Forms (`gf_*`), 27 static tools:**
 
 | Category | Tools | Client Methods |
 |----------|-------|----------------|
@@ -161,7 +161,9 @@ Responses are optimized for minimal token usage:
 | Notifications | `gf_send_notifications` | `sendNotifications` |
 | Feeds | `gf_list_feeds`, `gf_get_feed`, `gf_create_feed`, `gf_update_feed`, `gf_patch_feed`, `gf_delete_feed` | `listFeeds`, `getFeed`, `createFeed`, `updateFeed`, `patchFeed`, `deleteFeed` |
 | Utilities | `gf_get_field_filters`, `gf_get_results` | `getFieldFilters`, `getResults` |
-| Field Ops | `gf_add_field`, `gf_update_field`, `gf_delete_field`, `gf_list_field_types` | via `fieldOperationHandlers` → `FieldManager` |
+| Field Ops | `gf_add_field`, `gf_update_field`, `gf_delete_field`, `gf_set_choice_text`, `gf_list_field_types` | via `fieldOperationHandlers` → `FieldManager` |
+
+`gf_set_choice_text` is the narrow, safe alternative to `gf_update_field` for choice labels: it takes `{choiceValue: newLabelHtml}` and writes `text` only, so `value` (the routing key that drives confirmation pages, notifications and user meta) never rides along in the payload. A key matching no choice value is a hard error, not a silent no-op. Its dry-run flag is `dry_run`, not `test_mode` — passing `test_mode` is rejected rather than ignored, so muscle memory from the other three field tools can't produce a live write.
 
 **Plane B — GravityKit, dynamic.** Generated from the catalog, so the exact set depends on the connected site's GravityKit products and versions — each product under its own prefix; discover at runtime, don't hard-code. GravityView (prefix `gv_*`) currently contributes tool families for View lifecycle (`gv_view_create`, `gv_view_config_apply`, `gv_view_delete`, …), fields (`gv_view_field_add`/`patch`/`move`/`remove`), grid rows, widgets, search fields, and discovery/schema (`gv_layouts_list`, `gv_widgets_list`, `gv_field_type_schema_get`, `gv_available_fields_get`, …). Plus the built-in `gk_reload_abilities`. Use the `gv_*_list` discovery tools and `gv_field_type_schema_get` to introspect what's available; the server `instructions` string documents the GravityView authoring flow. To re-verify that prose tool names still match the live catalog, run `npm run verify:tool-names` (see Releasing).
 
@@ -394,7 +396,7 @@ No build step — pure ESM JavaScript, runs directly with `node src/index.js`. R
 
 7. **Delete operations are disabled by default.** `GRAVITY_FORMS_ALLOW_DELETE=true` must be set explicitly, or `deleteForm`/`deleteEntry`/`deleteFeed` throw. Intentional safety.
 
-8. **`mcp.json` may be stale.** The runtime source of truth is `GF_TOOL_DEFINITIONS` + the `ListToolsRequestSchema` handler in `src/index.js`, `fieldOperationTools` in `field-operations/index.js` (26 `gf_*` tools), the built-in `gk_reload_abilities`, and the dynamic `gv_*` tools from the abilities loader.
+8. **`mcp.json` may be stale.** The runtime source of truth is `GF_TOOL_DEFINITIONS` + the `ListToolsRequestSchema` handler in `src/index.js`, `fieldOperationTools` in `field-operations/index.js` (27 `gf_*` tools), the built-in `gk_reload_abilities`, and the dynamic `gv_*` tools from the abilities loader.
 
 9. **Self-signed certs for local dev.** Set `GRAVITY_FORMS_ALLOW_SELF_SIGNED_CERTS=true` to bypass certificate validation for local WordPress (Laravel Valet, Local WP, etc.). Never in production.
 
