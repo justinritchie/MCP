@@ -340,9 +340,43 @@ function wrapViewHandler(handler, params = {}, { ready = undefined } = {}) {
         ? { status, code: restBody.code, data: restBody.data }
         : undefined;
       logger.error(`gv_* tool error: ${message}${status ? ` (HTTP ${status})` : ''}`);
-      return createErrorResponse(message, details);
+      return createErrorResponse(enrichAbilityError(message, params), details);
     }
   };
+}
+
+/**
+ * Name the probable culprit on a oneOf/anyOf validation failure.
+ *
+ * The abilities API answers a batch call that is missing a sibling required
+ * field with "input does not match any of the expected formats" — naming
+ * neither the field nor which format failed. With a seven-item batch the
+ * natural reading is "one of my items is malformed", so the instinct is to
+ * bisect the batch, which cannot succeed because no item is wrong.
+ *
+ * Observed cost: gv_view_field_add(batch=[7 items]) failed exactly this way
+ * until `version` was added, at which point the identical call succeeded.
+ */
+function enrichAbilityError(message, params = {}) {
+  if (!/does not match any of the expected formats/i.test(String(message ?? ''))) {
+    return message;
+  }
+  const hints = [];
+  if (params && typeof params === 'object') {
+    // `version` is the optimistic-concurrency token these tools pair with batch
+    // input. Its absence is by far the most common cause of this error.
+    if (params.batch !== undefined && params.version === undefined && params.ifMatch === undefined) {
+      hints.push('`version` is absent. Batch input is validated as a distinct '
+        + 'format that requires it — add `version` (from gv_view_config_get) and '
+        + 'retry the SAME batch before suspecting any item in it.');
+    }
+    if (Array.isArray(params.batch)) {
+      hints.push(`The batch itself has ${params.batch.length} item(s); this error is `
+        + 'about the shape of the call as a whole, not about one item, so bisecting '
+        + 'the batch will not isolate it.');
+    }
+  }
+  return hints.length ? `${message}\n\n${hints.join('\n')}` : message;
 }
 
 // =================================
