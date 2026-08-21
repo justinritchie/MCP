@@ -404,10 +404,11 @@ export async function resolveAbilityCall(name, siteLabel, deps) {
   if (Object.prototype.hasOwnProperty.call(result.handlers, name)) {
     return { status: 'dispatch', handler: result.handlers[name], site: result.site };
   }
-  // Catalog is healthy but doesn't carry this tool. If it looks like a product
-  // tool, say which site was searched — otherwise it's a genuinely unknown name
-  // and index.js reports it as such.
-  if (/^g[a-z]{1,3}_/.test(name) && name.startsWith('gv_')) {
+  // Catalog is healthy but doesn't carry this tool. Any GravityKit product
+  // prefix (gv_, gc_, …) gets the "which site was searched" message — gf_* and
+  // gk_reload_abilities never reach here, they're handled in the switch above.
+  // Anything else is a genuinely unknown name; index.js reports it as such.
+  if (/^g[a-z]{1,3}_/.test(name)) {
     return {
       status: 'error',
       message: `'${name}' is not in the GravityKit abilities catalog for site '${result.site}' `
