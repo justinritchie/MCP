@@ -25,10 +25,14 @@ import { stripEmpty, stripEntryMetaFromResponse } from './utils/compact.js';
 import { WordPressClient } from './wp-client.js';
 import { loadAbilitiesAsTools } from './abilities/loader.js';
 import { runPlaneInit, buildToolList, classifyAbilityCall, resolveAbilitiesListTimeoutMs } from './server-runtime.js';
-// Local fork: multi-site fanout for the gf_* plane. All the machinery lives in
-// ./multisite.js so this stays a few small hooks that survive upstream rewrites
-// of index.js. See that file for the sites-config format and scope.
-import { multisiteActive, resolveSite, withSite, toolTakesSite, DEFAULT_SITE } from './multisite.js';
+// Local fork: multi-site fanout for BOTH planes — gf_* (Gravity Forms) and
+// gv_* (GravityKit abilities). All the machinery lives in ./multisite.js so
+// this stays a few small hooks that survive upstream rewrites of index.js.
+// See that file for the sites-config format and scope.
+import {
+  multisiteActive, resolveSite, withSite, toolTakesSite, DEFAULT_SITE,
+  abilitiesDefinitionsForList, resolveAbilityCall, reloadAbilitiesForSite,
+} from './multisite.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -88,6 +92,21 @@ async function pointGravityPlaneAtSite(siteLabel) {
   gravityFormsClient = client;
   fieldOperations = fieldOps;
 }
+// Same idea for plane B. multisite.js owns one WordPressClient + one abilities
+// catalog PER SITE (lazy, cached), so the module-global wpClient / abilities
+// state below is simply unused in the sites-file deployment. Heavy classes are
+// injected so multisite.js stays decoupled from upstream's file layout.
+const ABILITIES_DEPS = {
+  WordPressClient,
+  loadAbilitiesAsTools,
+  logger,
+  get reservedNames() { return RESERVED_TOOL_NAMES; },
+  onCatalogChanged: () => {
+    server.sendToolListChanged().catch((err) => {
+      logger.warn(`tools/list_changed notification failed: ${err.message}`);
+    });
+  },
+};
 
 /**
  * Initialize the two independent capability planes.
@@ -292,10 +311,15 @@ function wrapHandler(handler, params = {}) {
  *     so the agent sees `gv_rest_invalid_template` etc. instead of a
  *     generic "Request failed with status code 400". The inspector's
  *     errors are designed for AI consumption — preserve them.
+ *
+ * Local fork: `ready` overrides the readiness gate. In the multi-site
+ * deployment the WordPress client is per-site and owned by multisite.js, so
+ * the process-global `wpClient` is legitimately null while an ability call is
+ * perfectly runnable — see the abilities hook in CallTool.
  */
-function wrapViewHandler(handler, params = {}) {
+function wrapViewHandler(handler, params = {}, { ready = undefined } = {}) {
   return async () => {
-    if (!wpClient) {
+    if (!(ready ?? !!wpClient)) {
       return createErrorResponse('GravityView client not initialized');
     }
     try {
@@ -746,6 +770,14 @@ const RESERVED_TOOL_NAMES = new Set([
 ]);
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
+  // Local fork: start the per-site abilities catalog fetch FIRST, without
+  // awaiting, so it overlaps the Gravity Forms seed probe below instead of
+  // queueing behind it. Both are bounded; awaited together at the end. Exactly
+  // ONE site is contacted for abilities (the advertised one) — never a fan-out
+  // across the whole sites file.
+  const multisiteAbilityDefsPromise = multisiteActive()
+    ? abilitiesDefinitionsForList(ABILITIES_DEPS, { timeoutMs: resolveAbilitiesListTimeoutMs() })
+    : null;
   // Local fork: seed the GF plane from the default site so gf_* tools are
   // advertised (there is no GRAVITY_FORMS_* env for upstream's probe to use).
   if (multisiteActive() && !gravityFormsClient) {
@@ -765,6 +797,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   // retries. Clients that read tools/list only once (no list_changed support,
   // e.g. `claude -p`) can raise GRAVITYKIT_MCP_LIST_TIMEOUT_MS so this first
   // list blocks long enough to return the complete catalog.
+  // Local fork: in the sites-file deployment the catalog is per-site, so the
+  // advertised ability tools come from multisite.js (one site, same time
+  // budget, already in flight since the top of this handler). Upstream's
+  // process-wide loader is a no-op there — it returns immediately because
+  // there is no env-configured wpClient.
+  const multisiteAbilityDefs = multisiteAbilityDefsPromise ? await multisiteAbilityDefsPromise : null;
   await ensureAbilitiesLoaded({ timeoutMs: resolveAbilitiesListTimeoutMs() });
 
   // Gravity Forms tools are advertised only when that plane is live, so a
@@ -781,10 +819,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     gfReady: !!gravityFormsClient,
     gfToolDefs: GF_TOOL_DEFINITIONS,
     fieldOpTools: fieldOperationTools,
-    abilityDefs: abilityToolDefinitions,
+    abilityDefs: multisiteAbilityDefs ?? abilityToolDefinitions,
     gkReloadDef,
   });
-  // Local fork: expose the `site` param on gf_* tools when multi-site is active.
+  // Local fork: expose the `site` param on every tool when multi-site is active
+  // (gf_* selects a Gravity Forms client, gv_* and gk_* an abilities catalog).
   return { tools: multisiteActive() ? toolList.map(withSite) : toolList };
 });
 
@@ -796,13 +835,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: params } = request.params;
 
-  // Local fork: point the GF plane at the requested site (hot-reloads the sites
-  // config each call), then drop the `site` arg so it never reaches a Gravity
-  // Forms request. gf_* tools resolve the caller's site; anything else just
-  // ensures the GF client is seeded (from the default) since there is no env.
+  // Local fork: capture the caller's target site, point the GF plane at it
+  // (hot-reloads the sites config each call), then drop the `site` arg so it
+  // never reaches a Gravity Forms request or an ability input payload. gf_*
+  // tools resolve the caller's site here; gv_* / gk_reload_abilities carry
+  // `requestedSite` down to the abilities hooks in the default branch below.
+  let requestedSite;
   if (multisiteActive()) {
+    requestedSite = params && params.site;
     if (toolTakesSite(name)) {
-      try { await pointGravityPlaneAtSite(params && params.site); }
+      try { await pointGravityPlaneAtSite(requestedSite); }
       catch (e) { return createErrorResponse(e.message); }
     } else if (!gravityFormsClient) {
       try { await pointGravityPlaneAtSite(DEFAULT_SITE); } catch (_) { /* non-gf tool: GF plane optional */ }
@@ -924,6 +966,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // (re)fetched.
     default:
       if (name === 'gk_reload_abilities') {
+        // Local fork: per-site catalog. Refresh the requested site (default:
+        // the advertised one) and make it the site tools/list reflects.
+        if (multisiteActive()) {
+          const summary = await reloadAbilitiesForSite(requestedSite, ABILITIES_DEPS);
+          return { content: [{ type: 'text', text: JSON.stringify(summary, null, 2) }] };
+        }
         if (!wpClient) {
           return createErrorResponse(
             'WordPress client not initialized. Set GRAVITYKIT_WP_URL + GRAVITYKIT_WP_USERNAME + GRAVITYKIT_WP_APP_PASSWORD in .env (or reuse the GRAVITY_FORMS_* credentials).'
@@ -945,6 +993,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             }, null, 2),
           }],
         };
+      }
+      // Local fork: route ability calls through the caller's site catalog.
+      // Failures come back as a specific, actionable message ("GravityView is
+      // not active on 'x'", "no WordPress credentials for 'x' — add them to
+      // <file>") rather than a bare 404 or silence.
+      if (multisiteActive()) {
+        const routed = await resolveAbilityCall(name, requestedSite, ABILITIES_DEPS);
+        // `ready: true` — multisite.js already proved this site's WP client and
+        // catalog are live; the process-global wpClient is unused here.
+        if (routed.status === 'dispatch') return wrapViewHandler(() => routed.handler(params), params, { ready: true })();
+        if (routed.status === 'error') return createErrorResponse(routed.message);
+        return createErrorResponse(`Unknown tool: ${name}`);
       }
       // Any other name is a dynamic GravityKit ability tool (any product
       // prefix — gv_, gc_, …) or genuinely unknown. Self-heal the catalog
