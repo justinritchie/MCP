@@ -611,12 +611,23 @@ const GF_TOOL_DEFINITIONS = [
   },
   {
     name: 'gf_update_entry',
-    description: 'Update an entry. Checkbox/multiselect arrays auto-normalized; unmentioned fields preserved.',
+    description: 'Update an entry. Pass field values in the `values` object. Checkbox/multiselect arrays auto-normalized; unmentioned fields preserved.',
     annotations: { idempotentHint: false, openWorldHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         id: { type: 'number', description: 'Entry ID' },
+        values: {
+          type: 'object',
+          additionalProperties: true,
+          description: 'Field values keyed by field id ("1", "2") or sub-input ("1.3").\n'
+            + 'USE THIS RATHER THAN loose top-level numeric keys. An MCP client strips '
+            + 'arguments not declared in this schema before the request is sent, and '
+            + 'additionalProperties:true does NOT protect them — verified 2026-08-21: '
+            + 'the same call lands over stdio and arrives empty through a connector, '
+            + 'which is why this tool returned a clean 200 over a no-op. Loose keys '
+            + 'still work for direct/stdio callers.',
+        },
         status: {
           type: 'string',
           enum: ['active', 'spam', 'trash'],
@@ -644,13 +655,25 @@ const GF_TOOL_DEFINITIONS = [
   // Form Submissions (2 tools)
   {
     name: 'gf_submit_form_data',
-    description: 'Submit form data — runs the full pipeline (validation, notifications, confirmations, feeds/payment). Pass field values as top-level input_N keys (e.g. input_1, input_2; sub-inputs input_1_3).',
+    description: 'Submit form data — runs the full pipeline (validation, notifications, confirmations, feeds/payment). Pass field values in the `values` object.',
     annotations: { idempotentHint: false, openWorldHint: true },
     inputSchema: {
       type: 'object',
       properties: {
         form_id: { type: 'number', description: 'Form ID' },
-        field_values: { type: ['string', 'array'], description: 'GF dynamic-population values — a query string ("p1=a&p2=b") or array. NOT submission values; pass those as input_N keys.' }
+        values: {
+          type: 'object',
+          additionalProperties: true,
+          description: 'Field values keyed by field id ("1", "2") or sub-input ("1.3"). '
+            + 'Bare and input_-prefixed keys are both accepted and normalised.\n'
+            + 'USE THIS RATHER THAN loose top-level input_N keys. An MCP client strips '
+            + 'arguments not declared in this schema before the request is sent, and '
+            + 'additionalProperties:true does NOT protect them — verified 2026-08-21: '
+            + 'the same call lands over stdio and arrives empty through a connector, '
+            + 'which is why submissions came back "This field is required" for every '
+            + 'field. Loose keys still work for direct/stdio callers.',
+        },
+        field_values: { type: ['string', 'array'], description: 'GF dynamic-population values — a query string ("p1=a&p2=b") or array. NOT submission values; pass those in `values`.' }
       },
       additionalProperties: true,
       required: ['form_id']

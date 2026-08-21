@@ -746,7 +746,30 @@ export class GravityFormsClient {
    */
   async updateEntry(params) {
     return this.validateAndCall('gf_update_entry', params, async (validated) => {
-      const { id, ...updates } = validated;
+      const { id, values, ...looseUpdates } = validated;
+
+      // `values` carries the field map through an MCP client, which strips
+      // undeclared top-level keys (see the schema note). Loose numeric keys are
+      // merged first so stdio callers keep working; `values` wins on conflict
+      // because it is the explicit channel.
+      const updates = { ...looseUpdates };
+      if (values && typeof values === 'object') {
+        for (const [key, value] of Object.entries(values)) {
+          updates[String(key).replace(/^input_/, '')] = value;
+        }
+      }
+
+      // An update naming no field at all is almost always the silent-no-op bug
+      // rather than an intended call: the values were stripped in transit and
+      // the tool would otherwise return a clean 200 having written nothing.
+      const fieldKeys = Object.keys(updates).filter((k) => /^\d/.test(k));
+      if (!fieldKeys.length && updates.status === undefined) {
+        throw new Error(
+          'No field values and no status were received, so this update would do '
+          + 'nothing while returning 200. If you passed loose keys like "1": "x" '
+          + 'through an MCP client they were stripped in transit — pass them as '
+          + 'values: { "1": "x" } instead.');
+      }
 
       return resourceMutex.withLock(`entry:${id}`, async () => {
         const existingEntryResponse = await this.httpClient.get(`/entries/${id}`);
@@ -804,7 +827,24 @@ export class GravityFormsClient {
    */
   async submitFormData(params) {
     return this.validateAndCall('gf_submit_form_data', params, async (validated) => {
-      const { form_id, ...submissionData } = validated;
+      const { form_id, values, ...rest } = validated;
+
+      // Expand the declared `values` object into the input_N keys GF expects.
+      //
+      // Loose top-level input_N keys still work and are merged first, so a
+      // direct/stdio caller is unaffected — but they do not survive an MCP
+      // client, which strips undeclared arguments regardless of
+      // additionalProperties:true. That is why submissions arrived with every
+      // field empty and GF answered "This field is required" for all of them.
+      //
+      // Accepts "1", "input_1" and "1.3"; GF's wire form is input_1 / input_1_3.
+      const submissionData = { ...rest };
+      if (values && typeof values === 'object') {
+        for (const [key, value] of Object.entries(values)) {
+          const bare = String(key).replace(/^input_/, '').replace(/\./g, '_');
+          submissionData[`input_${bare}`] = value;
+        }
+      }
 
       // GF returns HTTP 400 {is_valid:false, validation_messages, …} on a
       // REJECTED submission. That is a normal "didn't pass validation" result,

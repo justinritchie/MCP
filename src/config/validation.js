@@ -595,7 +595,7 @@ export class ValidationFactory {
             typeof input.field_values !== 'string' &&
             !Array.isArray(input.field_values)
           ) {
-            throw new Error('field_values must be a string (e.g. "p1=a&p2=b") or array — it is GF dynamic-population data, not submission values; pass field values as input_N keys (e.g. input_1)');
+            throw new Error('field_values must be a string (e.g. "p1=a&p2=b") or array — it is GF dynamic-population data, not submission values; pass field values in the `values` object (e.g. values: {\"1\": \"abc\"})');
           }
           return subValidated;
 
