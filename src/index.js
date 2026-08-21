@@ -17,6 +17,7 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import GravityFormsClient from './gravity-forms-client.js';
 import { createFieldOperations, fieldOperationHandlers, fieldOperationTools } from './field-operations/index.js';
+import { confirmationOperationHandlers, confirmationOperationTools } from './confirmation-operations/index.js';
 import fieldRegistry from './field-definitions/field-registry.js';
 import FieldAwareValidator from './config/field-validation.js';
 import logger from './utils/logger.js';
@@ -789,6 +790,7 @@ const GF_TOOL_DEFINITIONS = [
 const RESERVED_TOOL_NAMES = new Set([
   ...GF_TOOL_DEFINITIONS.map((tool) => tool.name),
   ...fieldOperationTools.map((tool) => tool.name),
+  ...confirmationOperationTools.map((tool) => tool.name),
   'gk_reload_abilities',
 ]);
 
@@ -841,7 +843,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   const toolList = buildToolList({
     gfReady: !!gravityFormsClient,
     gfToolDefs: GF_TOOL_DEFINITIONS,
-    fieldOpTools: fieldOperationTools,
+    // Confirmation/notification tools ride the same gate as the field tools:
+    // both need a working Gravity Forms plane and nothing else.
+    fieldOpTools: [...fieldOperationTools, ...confirmationOperationTools],
     abilityDefs: multisiteAbilityDefs ?? abilityToolDefinitions,
     gkReloadDef,
   });
@@ -898,6 +902,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return wrapHandler(() => gravityFormsClient.deleteForm(params), params)();
     case 'gf_validate_form':
       return wrapHandler(() => gravityFormsClient.validateForm(params), params)();
+
+    // Confirmations & notifications — per-entry, read-modify-write.
+    //
+    // These take the raw GF client rather than fieldOperations: they patch one
+    // key of the form's confirmations/notifications map and PUT the whole form
+    // back, which needs getForm + replaceForm and nothing from the field layer.
+    case 'gf_list_confirmations':
+    case 'gf_update_confirmation':
+    case 'gf_add_confirmation':
+    case 'gf_delete_confirmation':
+    case 'gf_list_notifications':
+    case 'gf_update_notification':
+    case 'gf_add_notification':
+    case 'gf_delete_notification':
+      if (!gravityFormsClient) {
+        return createErrorResponse(`Gravity Forms client unavailable for ${name}`);
+      }
+      return wrapHandler(
+        () => confirmationOperationHandlers[name](params, gravityFormsClient),
+        params,
+      )();
 
     // Entries Management
     case 'gf_list_entries':
