@@ -362,6 +362,18 @@ export class FormsValidator extends BaseValidator {
       validated.notifications = this.validateObject(formData.notifications, 'notifications');
     }
 
+    // GF stores markupVersion in form meta and honours it on write (verified by
+    // signed PUT, 2026-08-21). Only 1 and 2 exist; anything else would be
+    // written verbatim into form meta and read back by
+    // GFCommon::is_legacy_markup_enabled as a silent truthy comparison.
+    if (formData.markupVersion !== undefined) {
+      const mv = Number(formData.markupVersion);
+      if (mv !== 1 && mv !== 2) {
+        throw new Error('markupVersion must be 1 (legacy ul/li) or 2 (modern div)');
+      }
+      validated.markupVersion = mv;
+    }
+
     if (formData.schedule_start !== undefined) {
       validated.schedule_start = this.validateDate(formData.schedule_start, 'schedule_start');
     }

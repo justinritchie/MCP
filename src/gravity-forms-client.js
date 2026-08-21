@@ -418,8 +418,36 @@ export class GravityFormsClient {
 
         const response = await this.httpClient.put(`/forms/${id}`, updatedFormData);
 
+        // Verify by read-back rather than trusting HTTP 200.
+        //
+        // This tool's characteristic failure is reporting success while changing
+        // nothing: GF returns 200 and a full form object whether or not it
+        // honoured a given key, so "it returned a form" proves only that a form
+        // exists. The markupVersion bug (2026-08-21) survived review precisely
+        // because the response was indistinguishable from a real write.
+        //
+        // Compare scalars only. fields/confirmations/notifications are
+        // normalised by GF on save (ids assigned, defaults filled), so
+        // structural inequality there is expected and not a fault.
+        const unapplied = [];
+        for (const [key, want] of Object.entries(updates)) {
+          if (want === null || typeof want === 'object') continue;
+          const got = response.data?.[key];
+          // Loose compare: GF round-trips numbers and booleans as strings
+          // ("1" for is_active). That is normalisation, not a failed write.
+          if (got !== undefined && String(got) !== String(want)) {
+            unapplied.push({ key, requested: want, actual: got });
+          }
+        }
+
         return {
-          form: response.data
+          form: response.data,
+          ...(unapplied.length ? {
+            unapplied,
+            warning: 'Gravity Forms did not apply every requested value — the '
+              + 'listed keys read back different from what was sent. Treat this '
+              + 'call as a partial write.'
+          } : {})
         };
       });
     });

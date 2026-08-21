@@ -399,7 +399,20 @@ const GF_TOOL_DEFINITIONS = [
         button: { type: 'object', description: 'Submit button settings' },
         confirmations: { type: 'object', description: 'Confirmation settings' },
         notifications: { type: 'object', description: 'Notification settings' },
-        is_active: { type: 'boolean', description: 'Form active state' }
+        is_active: { type: 'boolean', description: 'Form active state' },
+        // MUST stay declared. An MCP client drops arguments absent from this
+        // schema BEFORE the request reaches the server, so an undeclared key is
+        // not "passed through loosely" — it is silently deleted, and the tool
+        // returns 200 having done nothing. Verified 2026-08-21: identical calls
+        // succeed over stdio and no-op through the connector.
+        markupVersion: {
+          type: 'number',
+          enum: [1, 2],
+          description: 'Form HTML structure. 2 = modern div-based (GF 2.5+ default). '
+            + '1 = legacy ul/li markup, needed when an older stylesheet targets '
+            + '"ul.gform_fields li.gfield". GF removed the wp-admin toggle for this '
+            + 'in 2.10.x, so this parameter is the only remaining way to set it.'
+        }
       },
       required: ['title']
     }
@@ -422,7 +435,17 @@ const GF_TOOL_DEFINITIONS = [
         button: { type: 'object', description: 'Submit button settings' },
         confirmations: { type: 'object', description: 'Confirmation settings' },
         notifications: { type: 'object', description: 'Notification settings' },
-        is_active: { type: 'boolean', description: 'Form active state' }
+        is_active: { type: 'boolean', description: 'Form active state' },
+        // See the note on gf_create_form.markupVersion — undeclared keys are
+        // dropped by the client, not merely unvalidated by the server.
+        markupVersion: {
+          type: 'number',
+          enum: [1, 2],
+          description: 'Form HTML structure. 2 = modern div-based (GF 2.5+ default). '
+            + '1 = legacy ul/li markup, needed when an older stylesheet targets '
+            + '"ul.gform_fields li.gfield". Changing this alters the rendered HTML '
+            + 'of a live form — check the stylesheet before flipping it.'
+        }
       },
       required: ['id']
     }
