@@ -18,6 +18,7 @@ import { dirname, join } from 'path';
 import GravityFormsClient from './gravity-forms-client.js';
 import { createFieldOperations, fieldOperationHandlers, fieldOperationTools } from './field-operations/index.js';
 import { confirmationOperationHandlers, confirmationOperationTools } from './confirmation-operations/index.js';
+import { normalizeSiloSettings } from './gravityview/silo-settings.js';
 import fieldRegistry from './field-definitions/field-registry.js';
 import FieldAwareValidator from './config/field-validation.js';
 import logger from './utils/logger.js';
@@ -54,7 +55,7 @@ const server = new Server(
     capabilities: {
       tools: { listChanged: true }
     },
-    instructions: 'GravityKit MCP server. Tools come from two independent planes.\n\ngf_* are always-on Gravity Forms tools (forms, entries, feeds, notifications, fields), present on any site with working Gravity Forms REST credentials.\n\ngv_* (and other GravityKit product prefixes) are generated from the connected site\'s GravityKit Foundation abilities catalog. They are present only when Foundation and the product (GravityView for gv_*) are active, so the available set varies per site.\n\nEach tool is self-describing: its description and inputSchema document its parameters and behavior. The GravityView surface is discoverable through the gv_*_list tools (gv_views_list, gv_layouts_list, gv_widgets_list, gv_available_fields_get) and gv_field_type_schema_get for field, widget, and search-field shapes. To add or configure a search bar, prefer gv_search_bar_add — one call with a View id plus fields[] of {field_id, input?} creates the search_bar and its fields; use the low-level gv_search_field_* tools only for surgical slot edits after gv_view_config_get. gk_reload_abilities refreshes the catalog when product tools are missing or stale.'
+    instructions: 'GravityKit MCP server. Tools come from two independent planes.\n\ngf_* are always-on Gravity Forms tools (forms, entries, feeds, notifications, fields), present on any site with working Gravity Forms REST credentials.\n\ngv_* (and other GravityKit product prefixes) are generated from the connected site\'s GravityKit Foundation abilities catalog. They are present only when Foundation and the product (GravityView for gv_*) are active, so the available set varies per site.\n\nEach tool is self-describing: its description and inputSchema document its parameters and behavior. The GravityView surface is discoverable through the gv_*_list tools (gv_views_list, gv_layouts_list, gv_widgets_list, gv_available_fields_get) and gv_field_type_schema_get for field, widget, and search-field shapes. To add or configure a search bar, prefer gv_search_bar_add — one call with a View id plus fields[] of {field_id, input?} creates the search_bar and its fields; use the low-level gv_search_field_* tools only for surgical slot edits after gv_view_config_get. gk_reload_abilities refreshes the catalog when product tools are missing or stale.\n\nTWO THINGS THE CATALOG DOES NOT TELL YOU about View template_settings, both measured on a live View:\n\n1. Namespaced ("silo") settings such as DataTables. gv_template_settings_schema_get advertises these as dotted paths and says writes route to the correct meta key. Dotted DOES now work — this server converts it — but the UNDERSCORE spelling (datatables_save_state) does NOT: it lands as a top-level key nothing reads, while still returning 200 with the value echoed. That is how an entire DataTables configuration can appear to apply and be inert. Use the dotted form (datatables.save_state) or the nested form ({datatables: {save_state: …}}). Never the underscore form.\n\n2. gv_view_settings_patch is documented as merge-only, but passing null as a value REMOVES that key. It is the only way to delete a setting written by mistake.'
   }
 );
 
@@ -1094,6 +1095,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }],
         };
       }
+      // Dotted silo setting paths (datatables.save_state) are advertised by the
+      // catalog but do NOT persist — WordPress sanitize_key() eats the dot and
+      // invents a top-level key nothing reads, while still returning 200. Only
+      // the nested form reaches the silo meta key. Convert here so the
+      // documented spelling behaves as documented. See gravityview/silo-settings.js.
+      {
+        const normalized = normalizeSiloSettings(name, params);
+        if (normalized.converted.length) {
+          // Mutate in place rather than rebind: `params` is const here, and the
+          // surrounding code already mutates it (delete params.site).
+          params.template_settings = normalized.params.template_settings;
+          logger.info(
+            `[silo-settings] routed ${normalized.converted.length} dotted setting(s) to nested form: `
+            + normalized.converted.map((c) => c.from).join(', '));
+        }
+      }
+
       // Local fork: route ability calls through the caller's site catalog.
       // Failures come back as a specific, actionable message ("GravityView is
       // not active on 'x'", "no WordPress credentials for 'x' — add them to

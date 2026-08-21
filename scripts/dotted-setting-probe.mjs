@@ -67,12 +67,21 @@ for (const [label, payload, expect] of forms) {
               `${r.isError ? `   (tool error: ${r.text.slice(0, 60)})` : ''}`);
 }
 
-// Restore.
+// Restore — including removing the top-level key the underscore case creates.
+// null-to-remove works on this tool and is undocumented; without it the probe
+// leaves litter behind on every run.
 await call('gv_view_settings_patch', {
-  site: SITE, id: VIEW, template_settings: { datatables: { scrolly: ORIGINAL } },
+  site: SITE, id: VIEW,
+  template_settings: { datatables: { scrolly: ORIGINAL }, datatables_scrolly: null },
 });
 const end = await readState();
-console.log(`\nrestored: scrolly=${JSON.stringify(end.scrolly)}  junk=${JSON.stringify(end.junk)}`);
-console.log(end.scrolly === ORIGINAL ? 'restore OK' : '*** RESTORE FAILED — fix by hand ***');
+console.log(`\nrestored: scrolly=${JSON.stringify(end.scrolly)}  junk=${JSON.stringify(end.junk)}` +
+            `  strayUnderscore=${JSON.stringify(end.topLevelUnderscore)}`);
+// Loose compare: the abilities layer coerces a numeric string on write, so
+// "500" reads back as 500. Strict equality here reported a false failure.
+const clean = String(end.scrolly) === String(ORIGINAL)
+  && !end.junk.length && end.topLevelUnderscore === undefined;
+console.log(clean ? 'restore OK — View left exactly as found'
+                  : '*** RESTORE INCOMPLETE — check the View by hand ***');
 
 await client.close();
