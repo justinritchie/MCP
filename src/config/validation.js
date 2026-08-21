@@ -366,6 +366,12 @@ export class FormsValidator extends BaseValidator {
     // signed PUT, 2026-08-21). Only 1 and 2 exist; anything else would be
     // written verbatim into form meta and read back by
     // GFCommon::is_legacy_markup_enabled as a silent truthy comparison.
+    // Control flag, not a form property. Passed through so updateForm can read
+    // it; it must never reach the PUT body.
+    if (formData.replace_map !== undefined) {
+      validated.replace_map = BaseValidator.validateBoolean(formData.replace_map, 'replace_map');
+    }
+
     if (formData.markupVersion !== undefined) {
       const mv = Number(formData.markupVersion);
       if (mv !== 1 && mv !== 2) {

@@ -410,10 +410,49 @@ export class GravityFormsClient {
         const existingFormResponse = await this.httpClient.get(`/forms/${id}`);
         const existingForm = existingFormResponse.data;
 
+        // Refuse a whole-map write that would silently delete entries.
+        //
+        // The merge below is a shallow top-level spread, so supplying a
+        // `confirmations` or `notifications` object containing only the entry
+        // you meant to change DELETES every other entry — with a 200 response
+        // and no indication anything was lost. Six live AAR forms carry two
+        // notifications each (ADMIN: Send Email, ADMIN: Send SMS, HCS 2024 Wait
+        // List, on aaru65 and aarlocal), so this is a real loss, not a
+        // hypothetical one.
+        //
+        // Replacing a map is still legitimate — that is how you remove an entry
+        // by omission — so this is a confirmation gate, not a ban. The
+        // per-entry tools (gf_update_notification et al) are the everyday path
+        // and need no flag.
+        const { replace_map: replaceMap = false, ...formUpdates } = updates;
+        if (!replaceMap) {
+          for (const mapKey of ['confirmations', 'notifications']) {
+            const incoming = formUpdates[mapKey];
+            if (!incoming || typeof incoming !== 'object') continue;
+            const existing = existingForm?.[mapKey];
+            if (!existing || typeof existing !== 'object' || Array.isArray(existing)) continue;
+            const dropped = Object.keys(existing).filter(
+              (k) => !Object.prototype.hasOwnProperty.call(incoming, k));
+            if (dropped.length) {
+              const describe = dropped
+                .map((k) => `${k}${existing[k]?.name ? ` ("${existing[k].name}")` : ''}`)
+                .join(', ');
+              throw new Error(
+                `Refusing this update: the ${mapKey} object you supplied omits ` +
+                `${dropped.length} existing ${dropped.length > 1 ? 'entries' : 'entry'} ` +
+                `— ${describe} — and this write would DELETE ${dropped.length > 1 ? 'them' : 'it'}. ` +
+                `\n\nTo change one entry and leave the rest alone, use ` +
+                `gf_update_${mapKey.replace(/s$/, '')} (or gf_add_/gf_delete_). ` +
+                `\n\nIf you genuinely mean to replace the whole ${mapKey} map and ` +
+                `drop what you omitted, pass replace_map:true.`);
+            }
+          }
+        }
+
         // Merge updates with existing form data
         const updatedFormData = {
           ...existingForm,
-          ...updates
+          ...formUpdates
         };
 
         const response = await this.httpClient.put(`/forms/${id}`, updatedFormData);
@@ -430,7 +469,7 @@ export class GravityFormsClient {
         // normalised by GF on save (ids assigned, defaults filled), so
         // structural inequality there is expected and not a fault.
         const unapplied = [];
-        for (const [key, want] of Object.entries(updates)) {
+        for (const [key, want] of Object.entries(formUpdates)) {
           if (want === null || typeof want === 'object') continue;
           const got = response.data?.[key];
           // Loose compare: GF round-trips numbers and booleans as strings

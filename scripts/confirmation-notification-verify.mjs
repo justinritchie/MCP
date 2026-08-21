@@ -167,6 +167,44 @@ check('deleting a non-default confirmation succeeds', delOk.parsed?.success === 
 const listC3 = await call('gf_list_confirmations', { site: SITE, form_id: id });
 check('one confirmation remains', listC3.parsed?.count === 1, `count=${listC3.parsed?.count}`);
 
+// ---- 10. the gf_update_form whole-map guard -------------------------------
+//
+// The old destructive path must now refuse rather than silently delete. The
+// form still has two notifications at this point.
+const partialMap = await call('gf_update_form', {
+  site: SITE, form_id: id, id,
+  notifications: {
+    zz_second_notify: {
+      id: 'zz_second_notify', name: 'ZZ Second Notification',
+      event: 'form_submission', toType: 'email', to: '{admin_email}',
+      subject: 'ZZ via whole map', message: '{all_fields}',
+    },
+  },
+});
+check('gf_update_form REFUSES a map that drops an existing entry',
+      partialMap.isError || /would DELETE/.test(partialMap.text),
+      partialMap.text.slice(0, 100));
+
+const stillTwo = await call('gf_list_notifications', { site: SITE, form_id: id });
+check('the refused call wrote nothing', stillTwo.parsed?.count === 2,
+      `count=${stillTwo.parsed?.count}`);
+
+// replace_map:true is the deliberate escape hatch and must still work.
+const replaced = await call('gf_update_form', {
+  site: SITE, id, replace_map: true,
+  notifications: {
+    zz_second_notify: {
+      id: 'zz_second_notify', name: 'ZZ Second Notification',
+      event: 'form_submission', toType: 'email', to: '{admin_email}',
+      subject: 'ZZ via whole map', message: '{all_fields}',
+    },
+  },
+});
+const afterReplace = await call('gf_list_notifications', { site: SITE, form_id: id });
+check('replace_map:true still permits a deliberate whole-map replace',
+      !replaced.isError && afterReplace.parsed?.count === 1,
+      `count=${afterReplace.parsed?.count}`);
+
 console.log(`\n${pass} passed, ${fail} failed`);
 console.log(`\nscratch form ${id} — trash it with:`);
 console.log(`  python3 <outputs>/gf-trash-scratch.py ${id}`);

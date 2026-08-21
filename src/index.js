@@ -434,8 +434,30 @@ const GF_TOOL_DEFINITIONS = [
           items: { type: 'object' }
         },
         button: { type: 'object', description: 'Submit button settings' },
-        confirmations: { type: 'object', description: 'Confirmation settings' },
-        notifications: { type: 'object', description: 'Notification settings' },
+        confirmations: {
+          type: 'object',
+          description: 'WHOLE-MAP REPLACE — passing this REPLACES every confirmation '
+            + 'on the form. Any entry you omit is DELETED. To change one and leave '
+            + 'the rest alone, use gf_update_confirmation / gf_add_confirmation / '
+            + 'gf_delete_confirmation instead. A write that would drop entries is '
+            + 'refused unless replace_map:true.',
+        },
+        notifications: {
+          type: 'object',
+          description: 'WHOLE-MAP REPLACE — passing this REPLACES every notification '
+            + 'on the form. Any entry you omit is DELETED, and several live forms '
+            + 'carry two. Use gf_update_notification / gf_add_notification / '
+            + 'gf_delete_notification instead. A write that would drop entries is '
+            + 'refused unless replace_map:true.',
+        },
+        replace_map: {
+          type: 'boolean',
+          default: false,
+          description: 'Confirms you INTEND a whole-map replace of confirmations or '
+            + 'notifications, dropping entries you omitted. Only needed when the '
+            + 'supplied map omits entries that currently exist — the normal case '
+            + 'needs no flag. Removing an entry by omission is the legitimate use.',
+        },
         is_active: { type: 'boolean', description: 'Form active state' },
         // See the note on gf_create_form.markupVersion — undeclared keys are
         // dropped by the client, not merely unvalidated by the server.
