@@ -784,15 +784,21 @@ export class GravityFormsClient {
         }
       }
 
-      // An update naming no field at all is almost always the silent-no-op bug
+      // An update carrying nothing at all is almost always the silent-no-op bug
       // rather than an intended call: the values were stripped in transit and
       // the tool would otherwise return a clean 200 having written nothing.
-      const fieldKeys = Object.keys(updates).filter((k) => /^\d/.test(k));
-      if (!fieldKeys.length && updates.status === undefined) {
+      //
+      // The bar is deliberately "nothing whatsoever", not "no numeric field
+      // key". Entries carry updatable properties that are neither field values
+      // nor status — is_starred, is_read, payment_status, transaction_id — and
+      // an earlier version of this guard refused those outright. Anything the
+      // caller actually named is enough to prove the payload survived transit,
+      // which is the only thing this check is here to establish.
+      if (!Object.keys(updates).length) {
         throw new Error(
-          'No field values and no status were received, so this update would do '
-          + 'nothing while returning 200. If you passed loose keys like "1": "x" '
-          + 'through an MCP client they were stripped in transit — pass them as '
+          'This update named nothing to change, so it would do nothing while '
+          + 'returning 200. If loose keys like "1": "x" were passed through an '
+          + 'MCP client they were stripped in transit — pass them as '
           + 'values: { "1": "x" } instead.');
       }
 

@@ -439,6 +439,56 @@ suite.test('Update Entry: Should preserve all field data when updating single fi
   TestAssert.equal(result.entry.is_starred, '1', 'Updated field changed in response');
 });
 
+// The empty-update guard. It exists because an MCP client silently strips
+// undeclared top-level keys, so `{id, "1": "x"}` can arrive as `{id}` and the
+// update would return a clean 200 having written nothing.
+//
+// It shipped once drawn too tight — requiring a numeric field key or `status` —
+// which refused legitimate calls that only touch is_starred/is_read. These three
+// pin both edges: the guard fires on genuinely-empty, and stays out of the way
+// for any property the caller actually named.
+
+suite.test('Update Entry: refuses an update that names nothing at all', async () => {
+  let threw = null;
+  try {
+    await client.updateEntry({ id: 23 });
+  } catch (error) {
+    threw = error;
+  }
+  TestAssert.exists(threw, 'an update naming nothing should throw');
+  TestAssert.isTrue(threw.message.includes('named nothing to change'),
+    'the error should explain the no-op, not fail obscurely');
+  TestAssert.equal(mockHttpClient.getRequests().filter(r => r.method === 'PUT').length, 0,
+    'nothing should be written when the guard fires');
+});
+
+suite.test('Update Entry: a non-field property alone is enough (is_starred, is_read)', async () => {
+  const existing = { id: 23, form_id: 9, '1': 'John Doe', is_starred: '0', is_read: '0' };
+  mockHttpClient.setMockResponse('GET', '/entries/23', new MockResponse(existing));
+  mockHttpClient.setMockResponse('PUT', '/entries/23',
+    new MockResponse({ ...existing, is_read: '1' }));
+
+  // No numeric field key and no status — the shape the tightened guard wrongly refused.
+  await client.updateEntry({ id: 23, is_read: '1' });
+
+  const put = mockHttpClient.getRequests().find(r => r.method === 'PUT');
+  TestAssert.exists(put, 'is_read alone should reach the API');
+  TestAssert.equal(put.config.data.is_read, '1', 'is_read should be written');
+  TestAssert.equal(put.config.data['1'], 'John Doe', 'other fields still preserved');
+});
+
+suite.test('Update Entry: values{} alone satisfies the guard', async () => {
+  const existing = { id: 24, form_id: 9, '1': 'old' };
+  mockHttpClient.setMockResponse('GET', '/entries/24', new MockResponse(existing));
+  mockHttpClient.setMockResponse('PUT', '/entries/24', new MockResponse({ ...existing, '1': 'new' }));
+
+  await client.updateEntry({ id: 24, values: { '1': 'new' } });
+
+  const put = mockHttpClient.getRequests().find(r => r.method === 'PUT');
+  TestAssert.exists(put, 'a values-only update should reach the API');
+  TestAssert.equal(put.config.data['1'], 'new', 'the declared value should be written');
+});
+
 suite.test('Update Entry: Should preserve metadata when updating fields', async () => {
   const entry = generateMockEntry(1, {
     id: 1,
