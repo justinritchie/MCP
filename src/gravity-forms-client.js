@@ -11,6 +11,7 @@ import { ValidationFactory } from './config/validation.js';
 import logger from './utils/logger.js';
 import { sanitizeUrl, sanitizeHeaders } from './utils/sanitize.js';
 import { generateCompoundInputs, assignFieldIds } from './field-definitions/field-registry.js';
+import { applyAddonPropertyDefaults } from './field-operations/field-manager.js';
 import { testConfig } from './config/test-config.js';
 import { resourceMutex } from './utils/mutex.js';
 import { USER_AGENT } from './version.js';
@@ -372,6 +373,16 @@ export class GravityFormsClient {
       // Process fields to ensure compound types have proper inputs array.
       if (validated.fields && Array.isArray(validated.fields)) {
         validated.fields = validated.fields.map(field => {
+          // Supply add-on properties the GF editor writes that the REST API does
+          // not. Applied to EVERY field BEFORE the early return below — that
+          // branch exits for fields already carrying `inputs`, which are exactly
+          // the hand-authored ones most likely to need this.
+          //
+          // A choice field with gpiInventory and no gpiResourcePropertyMap is a
+          // PHP fatal on every front-end render of the WHOLE PAGE. See
+          // applyAddonPropertyDefaults for the isolation record.
+          applyAddonPropertyDefaults(field);
+
           if (field.inputs && Array.isArray(field.inputs) && field.inputs.length > 0) {
             return field;
           }
@@ -454,6 +465,20 @@ export class GravityFormsClient {
           ...existingForm,
           ...formUpdates
         };
+
+        // gf_update_form takes a WHOLE fields array and never touches
+        // FieldManager, so it bypassed the add/update normalizers entirely.
+        // Verified 2026-08-24: sending form 31's own fields back with
+        // gpiResourcePropertyMap deleted recreated the broken state and the form
+        // stopped rendering — .gform_wrapper present became absent.
+        //
+        // Fixing only create/add/update would have left the most destructive
+        // path open, because this one rewrites every field at once: a single
+        // careless whole-form PUT could break an inventory field on a live
+        // registration form with nothing in the response to show for it.
+        if (Array.isArray(updatedFormData.fields)) {
+          updatedFormData.fields.forEach((f) => applyAddonPropertyDefaults(f));
+        }
 
         const response = await this.httpClient.put(`/forms/${id}`, updatedFormData);
 

@@ -66,6 +66,7 @@ export class FieldManager {
 
     // Normalize layout grid properties (layoutGroupId, layoutGridColumnSpan)
     this.normalizeLayoutProperties(field, formId);
+    this.normalizeAddonProperties(field);
     
     // Calculate insertion position (page-aware)
     const insertIndex = this.positionEngine?.calculatePosition(
@@ -158,6 +159,7 @@ export class FieldManager {
       id: originalField.id // Preserve ID
     };
     this.normalizeLayoutProperties(form.fields[fieldIndex], formId);
+    this.normalizeAddonProperties(form.fields[fieldIndex]);
 
     // DRY RUN — return the computed result WITHOUT the PUT.
     //
@@ -554,6 +556,45 @@ export class FieldManager {
   }
 
   /**
+   * Supply add-on properties the Gravity Forms EDITOR writes but the REST API
+   * does not, where their absence breaks rendering.
+   *
+   * GP INVENTORY — gpiResourcePropertyMap. A choice field with a truthy
+   * `gpiInventory` and NO `gpiResourcePropertyMap` key is a PHP FATAL on every
+   * front-end render of the form: WordPress serves its "Critical Error" page,
+   * not a broken field. The whole page dies, including anything else embedded
+   * on it.
+   *
+   * Isolated 2026-08-24 on aar-u65 across six renders, one property at a time.
+   * The decisive pair: `gpiResourcePropertyMap: []` renders, the identical
+   * field with the key absent fatals. Confirmed against the live forms —
+   * form 1 field 17 (built in the GF UI, gpiInventory "simple") carries `[]`;
+   * form 29 field 1 (built through this MCP) has no such key and fatals.
+   *
+   * GP Inventory's render path evidently feeds the value to something that is a
+   * TypeError on null under PHP 8 rather than a warning.
+   *
+   * Nothing in the API response hints at this. The create call returns 200 with
+   * a clean field, gf_get_form reads it back fine, and gf_get_inventory reports
+   * sensible claimed/remaining numbers. Every signal the API can give says the
+   * form is healthy, right up until someone loads the page.
+   *
+   * SCOPE — deliberately narrow. The editor actually writes
+   * gpiResourcePropertyMap on EVERY field, inventory or not (verified on form 1:
+   * html, text, checkbox and radio fields all carry `[]`). This only supplies it
+   * where its absence is a proven fatal, because adding a GP Inventory property
+   * to fields that have nothing to do with inventory is a change with no
+   * evidence behind it. If a non-inventory field is ever shown to fatal without
+   * it, widen this then — with the render that proves it.
+   *
+   * Mutates and returns the field.
+   */
+  normalizeAddonProperties(field) {
+    return applyAddonPropertyDefaults(field);
+  }
+
+
+  /**
    * Generate compound sub-inputs (address.1, name.3, etc.)
    */
   generateSubInputs(field, fieldDef) {
@@ -693,4 +734,26 @@ export class FieldManager {
     // Note: Calculations and merge tags would need manual review
     // as they use string-based formulas that are harder to clean automatically
   }
+}
+
+/**
+ * Standalone form of FieldManager#normalizeAddonProperties.
+ *
+ * createForm builds fields without ever constructing a FieldManager, so the
+ * rule has to live somewhere both paths can reach. A field created by
+ * gf_create_form fatals exactly the same way as one added by gf_add_field —
+ * fixing only the latter would leave the more common path broken.
+ *
+ * See the class method's comment for the full isolation record.
+ */
+export function applyAddonPropertyDefaults(field) {
+  if (!field || typeof field !== 'object') return field;
+
+  if (field.gpiInventory &&
+      (!Object.prototype.hasOwnProperty.call(field, 'gpiResourcePropertyMap')
+       || field.gpiResourcePropertyMap === null)) {
+    field.gpiResourcePropertyMap = [];
+  }
+
+  return field;
 }
