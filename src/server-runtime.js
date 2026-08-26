@@ -50,18 +50,39 @@ export function classifyAbilityCall({ name, hasWpClient, handlers }) {
 /**
  * How long tools/list waits for the abilities catalog before shipping the list.
  *
- * Defaults to 2000ms — fast handshake; if the catalog isn't loaded yet the
- * product tools (gv_*) stream in afterward via tools/list_changed. That's fine
- * for clients that honor list_changed, but a ONE-SHOT client (e.g. `claude -p`)
- * reads tools/list once, so it would miss gv_* if the catalog is slower than the
- * wait. Such a client can raise GRAVITYKIT_MCP_LIST_TIMEOUT_MS to make the first
- * tools/list block long enough to return the complete catalog. Non-positive or
- * non-numeric values fall back to the default.
+ * DEFAULT RAISED 2000 -> 10000 (2026-08-26), because 2s was losing the race on
+ * real sites and losing it SILENTLY.
+ *
+ * Measured on the AAR sites, interval between the two tools/list_changed on a
+ * single startup: 3.72s, 3.55s, 4.12s. The catalog load genuinely succeeds and
+ * logs "Loaded 50 GravityKit abilities" every time — but tools/list had already
+ * answered ~1.5s earlier with a gf_*-only surface, and a client that takes the
+ * first list for the session never sees gv_*. Restarts, connector toggles and
+ * reboots all re-run the same race and lose it the same way, which is exactly
+ * why it reads as "the tools disappeared".
+ *
+ * The old default assumed a warm ~800ms load, and that assumption was the whole
+ * bug: it was tuned against a fast site and never revisited against a slow one.
+ *
+ * 10s is chosen to sit comfortably above the observed 4.1s worst case while
+ * still bounding a genuinely hung site. This only costs anything on the FIRST
+ * tools/list of a session, and only when the catalog is actually loading — an
+ * unreachable WP fails its client init fast and disables abilities without
+ * waiting here at all.
+ *
+ * Clients that honor tools/list_changed do not strictly need this, but there is
+ * no way to detect that from here, and being right for the one-shot case costs
+ * a few seconds once.
+ *
+ * GRAVITYKIT_MCP_LIST_TIMEOUT_MS still overrides. Non-positive or non-numeric
+ * values fall back to the default.
  *
  * @param {Record<string,string|undefined>} [env]
  * @returns {number} milliseconds
  */
+export const ABILITIES_LIST_TIMEOUT_DEFAULT_MS = 10000;
+
 export function resolveAbilitiesListTimeoutMs(env = process.env) {
   const raw = Number(env.GRAVITYKIT_MCP_LIST_TIMEOUT_MS);
-  return Number.isFinite(raw) && raw > 0 ? raw : 2000;
+  return Number.isFinite(raw) && raw > 0 ? raw : ABILITIES_LIST_TIMEOUT_DEFAULT_MS;
 }

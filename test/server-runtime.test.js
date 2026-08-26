@@ -5,7 +5,8 @@
 
 import test from 'node:test';
 import assert from 'node:assert';
-import { runPlaneInit, buildToolList, classifyAbilityCall, resolveAbilitiesListTimeoutMs } from '../src/server-runtime.js';
+import { runPlaneInit, buildToolList, classifyAbilityCall, resolveAbilitiesListTimeoutMs,
+         ABILITIES_LIST_TIMEOUT_DEFAULT_MS } from '../src/server-runtime.js';
 
 test('buildToolList: omits a missing gkReloadDef instead of emitting undefined', () => {
   const list = buildToolList({ gfReady: false });
@@ -86,8 +87,21 @@ test('classifyAbilityCall: catalog-unreachable when WP is up but catalog not loa
 
 // --- resolveAbilitiesListTimeoutMs (how long tools/list waits for the catalog) ---
 
-test('resolveAbilitiesListTimeoutMs: defaults to 2000 when unset', () => {
-  assert.equal(resolveAbilitiesListTimeoutMs({}), 2000);
+// Asserted against the exported constant, not a literal. These two tests hard-coded
+// 2000 and so had to be edited when the default was raised to 10000 — which means
+// they were pinning a NUMBER rather than the behaviour (unset falls back to the
+// default). Pinning the constant keeps the behaviour covered without re-breaking
+// every time the value is retuned.
+test('resolveAbilitiesListTimeoutMs: falls back to the default when unset', () => {
+  assert.equal(resolveAbilitiesListTimeoutMs({}), ABILITIES_LIST_TIMEOUT_DEFAULT_MS);
+});
+
+// The value itself is load-bearing, so assert it separately and deliberately:
+// 2000 lost the race against a real 3.5-4.1s catalog load, silently.
+test('the default sits above the observed catalog load time (~4.1s worst case)', () => {
+  assert.ok(ABILITIES_LIST_TIMEOUT_DEFAULT_MS >= 8000,
+    `default is ${ABILITIES_LIST_TIMEOUT_DEFAULT_MS}ms; anything near the measured `
+    + '3.5-4.1s load will drop gv_* from tools/list without failing loudly');
 });
 
 test('resolveAbilitiesListTimeoutMs: honors a valid override (e.g. a one-shot client needing the full catalog)', () => {
@@ -95,7 +109,7 @@ test('resolveAbilitiesListTimeoutMs: honors a valid override (e.g. a one-shot cl
 });
 
 test('resolveAbilitiesListTimeoutMs: ignores non-positive / non-numeric values', () => {
-  assert.equal(resolveAbilitiesListTimeoutMs({ GRAVITYKIT_MCP_LIST_TIMEOUT_MS: '0' }), 2000);
-  assert.equal(resolveAbilitiesListTimeoutMs({ GRAVITYKIT_MCP_LIST_TIMEOUT_MS: '-5' }), 2000);
-  assert.equal(resolveAbilitiesListTimeoutMs({ GRAVITYKIT_MCP_LIST_TIMEOUT_MS: 'abc' }), 2000);
+  assert.equal(resolveAbilitiesListTimeoutMs({ GRAVITYKIT_MCP_LIST_TIMEOUT_MS: '0' }), ABILITIES_LIST_TIMEOUT_DEFAULT_MS);
+  assert.equal(resolveAbilitiesListTimeoutMs({ GRAVITYKIT_MCP_LIST_TIMEOUT_MS: '-5' }), ABILITIES_LIST_TIMEOUT_DEFAULT_MS);
+  assert.equal(resolveAbilitiesListTimeoutMs({ GRAVITYKIT_MCP_LIST_TIMEOUT_MS: 'abc' }), ABILITIES_LIST_TIMEOUT_DEFAULT_MS);
 });

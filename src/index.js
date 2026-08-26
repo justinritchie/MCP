@@ -910,6 +910,32 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   const multisiteAbilityDefs = multisiteAbilityDefsPromise ? await multisiteAbilityDefsPromise : null;
   await ensureAbilitiesLoaded({ timeoutMs: resolveAbilitiesListTimeoutMs() });
 
+  // BE LOUD WHEN THIS LIST GOES OUT INCOMPLETE.
+  //
+  // This is the most expensive silence in the server. When the wait expires the
+  // catalog load carries on and eventually logs its cheerful "Loaded 50
+  // GravityKit abilities" — but tools/list already shipped without them, and
+  // that list is what the client uses for the session. Every visible signal said
+  // success while the client held a surface with zero gv_* tools. The only trace
+  // of the miss was a tools/list_changed arriving too late to matter.
+  //
+  // That combination cost a full afternoon: credentials, duplicate processes and
+  // three app restarts were all chased before anyone compared log timings. Say
+  // it plainly instead, and name the two things that actually resolve it.
+  const abilitiesStillLoading = !!abilitiesLoadPromise || !!multisiteAbilityDefsPromise;
+  const abilitiesInThisList =
+    (Array.isArray(multisiteAbilityDefs) && multisiteAbilityDefs.length > 0)
+    || (Array.isArray(abilityToolDefinitions) && abilityToolDefinitions.length > 0);
+  if (abilitiesStillLoading && !abilitiesInThisList) {
+    logger.warn(
+      'tools/list is shipping WITHOUT any GravityKit ability tools (no gv_*). The '
+      + `catalog did not finish within ${resolveAbilitiesListTimeoutMs()}ms, and THIS list `
+      + 'is what the client uses for the session — a later "Loaded N abilities" line does '
+      + 'NOT mean the client can see them. Fix: raise GRAVITYKIT_MCP_LIST_TIMEOUT_MS above '
+      + 'the real load time, or call gk_reload_abilities(site="<site>"), which has no time cap.'
+    );
+  }
+
   // Gravity Forms tools are advertised only when that plane is live, so a
   // WP-only install never lists gf_* tools that can't run. gk_reload_abilities
   // is always present (the manual escape hatch after fixing a WP/cert issue);
