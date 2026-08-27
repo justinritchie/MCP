@@ -10,7 +10,7 @@
  *   views          View settings / status / duplicate / delete
  *   view-fields    field add / settings / reorder / remove
  *   view-widgets   widget add / remove
- *   search         search-bar field add / configure
+ *   search         search-bar field add / configure / horizontal (side-by-side) layout
  *   grid           Layout Builder grid-row add / populate
  */
 
